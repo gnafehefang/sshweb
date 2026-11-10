@@ -1,5 +1,9 @@
 # SSHWeb · 我的世界农场版
 
+> **本 fork 为安全加固版（默认“探针版”）。** 与上游的主要区别：默认关闭网页 SSH、管理入口与公开站分离（独立监听口 + 独立主机名）、
+> 不再有默认密码、探针查看 Cookie 带签名、探针 agent 用一次性注册码安装并以无特权用户运行、只信任指定反代的转发头。
+> **部署请按 [docs/SECURITY-DEPLOY.md](docs/SECURITY-DEPLOY.md) 操作。** 下文保留上游说明，与该文档冲突时以该文档为准。
+
 把你的服务器变成一座 **Minecraft 风格农场**：每台 SSH 服务器是一只鸡，公开探针是带国旗的探针鸡，游客是随机造型的农场主。在浏览器里 3D 漫游、追鸡，把鸡打倒后打开**真 PTY 网页终端**（vim / htop 原样可用），还能挖矿、建造、和其他游客互啄。
 
 单二进制 / 单容器部署，无外部 CDN 依赖（three.js、xterm.js、306 国国旗图全部内置）。
@@ -15,15 +19,15 @@
 - 密码或 SSH 私钥（支持口令）认证，凭据只存在你自己机器上
 
 ### 📡 公开探针（服务器状态鸡）
-- 右上角「📡 加入」生成一键安装命令，**任何服务器**（不限于管理员自己的）都能接入：
+- 管理员在管理面板「📡 部署探针」生成一键安装命令（含 30 分钟内有效、只能用一次的注册码）：
 
   ```bash
-  curl -fsSL 'https://你的域名/probe/agent.sh?t=***' | sudo bash
+  curl -fsSL 'https://你的域名/probe/agent.sh' | sudo bash -s -- swe_***
   ```
 
-- 纯 bash + systemd agent，无二进制依赖（curl 缺失自动用 wget），每 5 秒上报：CPU / 内存 / 磁盘 / 上下行网速 / 负载 / 在线时长 / 进程数 / CPU 型号
+- 纯 bash + systemd agent（需要 curl 7.55+），以无特权用户运行，每 5 秒上报：CPU / 内存 / 磁盘 / 上下行网速 / 负载 / 在线时长 / 进程数 / CPU 型号
 - 探针鸡头顶**大信息卡**直显全部数据；国旗按上报 IP 自动识别（内置 306 国旗图，离线可用）
-- 生成时可配置：**完全公开** 或 **密码查看**（游戏内登录框输入查看密码解锁，HttpOnly Cookie 保存 7 天）；IP 可选**第三段掩码**（如 `203.0.xxx.1`）
+- 生成时可配置：**完全公开** 或 **密码查看**（游戏内输入查看密码解锁，签名 Cookie 保存 7 天，管理员可一键撤销）；IP 可选**掩码**（如 `203.0.*.*`）
 - 一键卸载：
 
   ```bash
@@ -125,9 +129,17 @@ go build -o sshweb .
 
 | 参数 / 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `-listen` | `:45678` | 监听地址 |
-| `-data` / `SSHWEB_DATA` | `data` | 数据目录（SQLite `sshweb.db`，0600；旧版 `data.json` 首次启动自动迁移） |
-| `SSHWEB_PASSWORD` | `admin888` | 仅**首次启动**生效；之后用管理面板修改 |
+| `-listen` | `127.0.0.1:45678` | 公开口（农场、探针上报/解锁、安装脚本、Skill 接口） |
+| `-admin-listen` | `127.0.0.1:45679` | 管理口（登录、探针管理、API Key 等）；留空则不启用 |
+| `-data` / `SSHWEB_DATA` | `data` | 数据目录（SQLite `sshweb.db`）；出现旧版 `data.json` 会拒绝启动 |
+| `SSHWEB_PUBLIC_URL` | —（必填） | 公开站 https 地址；安装脚本里的面板地址只取这里 |
+| `SSHWEB_ADMIN_ORIGIN` | —（启用管理口时必填） | 管理站 https Origin，主机名必须与公开站不同 |
+| `SSHWEB_TRUSTED_PROXIES` | 空 | 可信反代 IP/CIDR；只有来自这些地址的请求才读取 `X-Forwarded-For` |
+| `SSHWEB_ENABLE_SSH` | `0` | `1` 开启网页 SSH（见部署文档中的风险说明） |
+| `SSHWEB_PASSWORD` | 无 | 仅首次启动使用，至少 12 位；未设置则拒绝启动 |
+| `SSHWEB_GEOIP` | `0` | `1` 开启国旗识别（会把 IP 发给 ip-api.com） |
+| `SSHWEB_LEGACY_AGENT_UNTIL` | 空 | 旧版 `?t=` agent 兼容截止日期（YYYY-MM-DD），留空即不兼容 |
+| `SSHWEB_DEV` | `0` | 本地开发：允许 http 地址和非 Secure Cookie |
 
 ### Nginx 反向代理 + HTTPS 示例
 
@@ -135,14 +147,17 @@ go build -o sshweb .
 location / {
     proxy_pass http://127.0.0.1:45678;
     proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;        # WebSocket（终端 / 游戏大厅）
+    proxy_set_header Upgrade $http_upgrade;        # WebSocket（游戏大厅）
     proxy_set_header Connection "upgrade";
     proxy_read_timeout 3600s;
-    proxy_set_header X-Forwarded-Proto $scheme;    # 探针安装命令跟随 https
-    proxy_set_header X-Forwarded-Host $host;       # 探针安装命令跟随你的域名
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;  # 游客/探针国家识别
+    proxy_set_header Host $host;
+    # 覆盖而不是追加：客户端自带的 X-Forwarded-For 不能透传
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-IP $remote_addr;
 }
 ```
+
+面板地址不再从请求头推断，必须通过 `SSHWEB_PUBLIC_URL` 配置。
 
 ## 操作说明
 
@@ -158,13 +173,13 @@ location / {
 
 ## 安全须知（请先读完再暴露公网）
 
-- 本面板等价于「把 SSH 入口搬进浏览器」：首次启动**务必**设置强密码（`SSHWEB_PASSWORD` 或界面修改），默认密码等于没有密码
-- 所有凭据（SSH 密码 / 私钥、管理密码、探针 token、探针查看密码）只保存在你自己机器的 SQLite 数据库（`sshweb.db`，0600 目录），任何 API 响应都不下发
-- 探针 token 是安装凭据：泄露者只能冒充上报数据，无法读取任何信息；必要时删除探针重新生成
+- 本 fork 默认不开启网页 SSH；开启后面板等价于「把 SSH 入口搬进浏览器」，SSH 凭据目前仍以明文保存在 SQLite 中，详见部署文档
+- 管理密码、探针查看密码只保存 Argon2id 哈希；探针 token、注册码、API Key 只保存 SHA-256 哈希
+- 探针 token 只在被监控机 `/etc/sshweb-probe/auth-header`（root 0600）中；泄露者只能冒充上报，可在管理面板一键轮换
 - **API Key 等价于建造权限**：任何持有 Key 的 Agent 可以批量增删方块并控制在线角色（传送/飞行）；Key 可随时在管理面板删除；不要把 Key 提交到公开仓库
 - 游客与 IP 绑定仅用于昵称/材料持久化，不存储任何可识别个人信息
-- 建议置于 HTTPS 反代之后；有条件用防火墙限制端口来源
-- 目标服务器主机密钥不做校验（面板托管场景），适合自建内网 / 云机管理
+- 公开口只应映射到宿主机回环地址并经 HTTPS 反代；管理口只应经私有网关（如 Tailscale Serve）访问
+- 开启 SSH 时，目标服务器主机密钥目前仍不做校验（计划在后续阶段加入），务必使用专用低权限账户
 
 ## 从源码构建
 

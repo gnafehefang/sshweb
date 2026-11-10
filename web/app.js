@@ -2733,7 +2733,7 @@ function openAdmin() {
     <h2>🐔 农场管理</h2>
     <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
       ${state.ssh ? '<button class="mc-btn sm" id="admAdd">+ 添加服务器（新鸡）</button>' : ''}
-      <button class="mc-btn sm" id="admJoin">📡 部署公开探针</button>
+      <button class="mc-btn sm" id="admJoin">📡 部署探针</button>
       <button class="mc-btn sm" id="admKeys">🤖 AI Skill API Key</button>
       <button class="mc-btn sm" id="admPw">修改管理密码</button>
       <button class="mc-btn sm danger" id="admClear" style="background:#a33;border-color:#822">🧹 清除所有方块</button>
@@ -2741,7 +2741,7 @@ function openAdmin() {
     ${!state.ssh ? '' : state.servers.length ? `<table class="sv-table">
       <thead><tr><th>服务器</th><th>区域</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
       <tbody>${rows}</tbody></table>` : '<div class="notice">农场还没有鸡。点「添加服务器」引入第一只。</div>'}
-    ${probeRows ? `<h3 style="margin:18px 0 8px;font-size:.9rem">📡 公开探针</h3>
+    ${probeRows ? `<h3 style="margin:18px 0 8px;font-size:.9rem">📡 探针</h3>
     <table class="sv-table"><thead><tr><th>探针</th><th>可见性</th><th>状态</th><th style="text-align:right">操作</th></tr></thead><tbody>${probeRows}</tbody></table>` : ''}
   `);
   if (state.ssh) $('#admAdd').onclick = () => openForm(null);
