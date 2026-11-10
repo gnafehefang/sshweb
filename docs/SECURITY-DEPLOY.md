@@ -139,7 +139,10 @@ ip -4 -o addr | grep 172.30.10   # 应看到某个 br-… 网卡上的 172.30.10
 ## 4. 验收
 
 脚本需要 `curl` 和 `jq`，按对象检查 JSON 字段；请求失败、响应无法解析、缺少工具都记为失败，
-条件不具备的项记为“跳过”（跳过不等于通过）。建议在 Linux 或 WSL 上运行。
+结果无法判定的项记为“待确认”，条件不具备的项记为“跳过”，两者都不等于通过。建议在 Linux 或 WSL 上运行。
+
+端口检查先确认本机能与 VPS 的 443 建立 TCP 连接（对照），再检查 45678/45679：
+TCP 一旦建立（包括建立后等待响应超时）即判为“可达”；对照正常时拒绝或连接超时判为通过；对照失败时一律“待确认”。
 
 在**公网上另一台机器**执行：
 
@@ -189,27 +192,31 @@ sudo docker compose start
 sudo gzip -t "$B" && sudo tar tzf "$B" | grep -qx './sshweb.db' && echo "备份可用：$B"
 ```
 
-恢复时**不要覆盖现有数据卷**：解压到新卷、检查后切换，原卷保留到恢复验收完成。
+压缩包校验只说明文件完整。想确认备份里的数据库能正常读出，可以对它跑一次恢复脚本的只检查模式（会创建一个临时数据卷，检查后按提示删除）：
 
 ```bash
-B=/root/backup/sshweb-2026-11-10.tgz          # 换成要恢复的文件
-N=sshweb-restore-$(date +%Y%m%d%H%M)
-sudo gzip -t "$B" && sudo tar tzf "$B" | grep -qx './sshweb.db' || { echo "备份不可用，停止"; false; }
-sudo docker volume create "$N"
-sudo docker run --rm -v "$N":/data -v "$(dirname "$B")":/backup:ro alpine tar xzf "/backup/$(basename "$B")" -C /data
-sudo docker run --rm -v "$N":/data:ro alpine sh -c \
-  'apk add --no-cache sqlite >/dev/null && sqlite3 "file:/data/sshweb.db?immutable=1" "PRAGMA integrity_check;" && ls -ln /data'
-# integrity_check 应输出 ok；文件属主应与原卷一致（可对比 docker run --rm -v "$V":/data:ro alpine ls -ln /data）
+sudo scripts/restore-backup.sh "$B" --check-only
 ```
 
-确认无误后，用 `docker-compose.override.yml` 让服务改用新卷（Compose 会自动合并该文件）：
+恢复用仓库自带的 `scripts/restore-backup.sh`。它任何一步失败都会立即退出，原数据卷始终不改动：
 
 ```bash
-printf 'volumes:\n  sshweb-probe-data:\n    external: true\n    name: %s\n' "$N" | sudo tee docker-compose.override.yml
-sudo docker compose up -d --force-recreate sshweb
+cd /opt/sshweb
+sudo scripts/restore-backup.sh /root/backup/sshweb-2026-11-10.tgz --check-only   # 只检查，不切换
+sudo scripts/restore-backup.sh /root/backup/sshweb-2026-11-10.tgz                # 检查通过后询问是否切换
 ```
 
-验收通过前保留原卷；要退回，删除 `docker-compose.override.yml` 后再执行一次 `up -d --force-recreate`。
+脚本依次执行：
+
+1. 校验压缩包完整、包含 `./sshweb.db`、没有绝对路径或 `..`。
+2. 从运行中的容器读出镜像、当前数据卷和应用运行用户。
+3. 解压到一个新数据卷（不碰原卷）。
+4. 检查新卷里所有文件的属主都是应用运行用户。
+5. 把新卷内容复制到临时目录后**正常打开**数据库（会应用 WAL），检查 `integrity_check`、管理密码哈希、探针 Cookie 签名密钥、没有旧版明文密码；探针模式下还要求没有服务器记录；并列出恢复卷与当前卷各表的行数供核对。
+6. 你输入 `yes` 后，写入 `docker-compose.override.yml` 切换到新卷并重建容器；容器 5 秒内没有正常运行就自动退回原配置。
+
+不要用 `immutable=1` 方式检查：它不读取 WAL，`docker compose stop` 之后的数据可能全部还在 WAL 里。
+验收通过前保留原卷；要退回，删除（或恢复备份的）`docker-compose.override.yml` 后执行 `sudo docker compose up -d --force-recreate sshweb`。
 
 探针版的库中没有 SSH 凭据，但包含管理密码哈希、探针 Cookie 签名密钥和各类 token 哈希，备份仍应妥善保管。
 

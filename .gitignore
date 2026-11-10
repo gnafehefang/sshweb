@@ -5,3 +5,6 @@ sshweb-*
 data/
 *.tar.gz
 .DS_Store
+# 恢复备份时生成的本机配置
+docker-compose.override.yml
+docker-compose.override.yml.bak-*

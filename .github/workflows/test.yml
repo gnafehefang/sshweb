@@ -38,7 +38,7 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: shell syntax
-        run: bash -n scripts/verify-deploy.sh
+        run: bash -n scripts/verify-deploy.sh && bash -n scripts/restore-backup.sh
 
       - name: docker build
         run: docker build -t sshweb-ci .

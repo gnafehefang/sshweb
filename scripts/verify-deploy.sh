@@ -4,10 +4,11 @@
 #   - 在公网上另一台 Linux 机器（或 WSL）执行：检查公开站与端口暴露
 #   - 在 tailnet 设备上带第三个参数执行：额外检查管理站
 #
-# 结果分三类：✅ 通过 / ❌ 失败 / ⏭ 跳过。
+# 结果分四类：✅ 通过 / ❌ 失败 / ⚠️ 待确认 / ⏭ 跳过。
 #   请求失败、响应无法解析、缺少工具一律记为失败，不会被当成通过；
+#   待确认表示结果无法判定（例如对照端口也连不上），需要人工复查；
 #   跳过项表示条件不具备（例如还没有密码探针），不代表该项已验证。
-# 退出码：0 = 没有失败项；1 = 有失败项；2 = 参数或依赖缺失。
+# 退出码：0 = 没有失败项和待确认项；1 = 有失败或待确认；2 = 参数或依赖缺失。
 set -u
 
 PUB="${1:-}"
@@ -24,9 +25,10 @@ PUB="${PUB%/}"; ADM="${ADM%/}"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-pass=0; fail=0; skip=0
+pass=0; fail=0; unk=0; skip=0
 ok()  { echo "  ✅ $*"; pass=$((pass+1)); }
 bad() { echo "  ❌ $*"; fail=$((fail+1)); }
+unk() { echo "  ⚠️  $*"; unk=$((unk+1)); }
 skp() { echo "  ⏭  $*"; skip=$((skip+1)); }
 
 # fetch <输出文件> <curl 参数…>：打印 HTTP 状态码；curl 本身失败时打印 ERR
@@ -136,17 +138,35 @@ else
   fi
 fi
 
+# tcp_probe <URL>：打印 “curl 退出码 time_connect”。
+#   time_connect > 0 表示 TCP 已建立；此后的超时（退出码 28）也算可达。
+tcp_probe() {
+  local out rc
+  out=$(curl -s -o /dev/null -k --connect-timeout 5 -m 8 -w '%{time_connect}' "$1" 2>/dev/null) && rc=0 || rc=$?
+  echo "$rc ${out:-0}"
+}
+tcp_connected() { awk -v t="$1" 'BEGIN { exit !(t + 0 > 0) }'; }
+
 if [ -n "$IP" ]; then
   echo "== 端口暴露 $IP（请在公网上另一台机器执行）"
+  # 对照：先确认本机能与 VPS 的 443 建立 TCP 连接。对照失败时，连不上内部端口无法证明它被过滤。
+  read -r crc ctc <<<"$(tcp_probe "https://$IP/")"
+  if tcp_connected "$ctc"; then
+    ctl=ok; ok "对照：$IP:443 可建立 TCP 连接"
+  else
+    ctl=no; unk "对照：$IP:443 无法建立 TCP 连接（curl 退出码 $crc），下面的端口结果无法判定"
+  fi
   for port in 45678 45679; do
-    curl -s -o /dev/null -m 5 "http://$IP:$port/" 2>/dev/null
-    rc=$?
-    case "$rc" in
-      7)  ok "端口 $port 拒绝连接" ;;
-      28) ok "端口 $port 连接超时（被过滤）" ;;
-      0|52|56) bad "端口 $port 对外可达（curl 退出码 $rc）" ;;
-      *)  bad "端口 $port 无法判断：curl 退出码 $rc（检查 IP 是否填对、本机网络是否正常）" ;;
-    esac
+    read -r rc tc <<<"$(tcp_probe "http://$IP:$port/")"
+    if tcp_connected "$tc"; then
+      bad "端口 $port 对外可达：TCP 已建立（curl 退出码 $rc）"
+    elif [ "$ctl" = ok ] && [ "$rc" = 7 ]; then
+      ok "端口 $port 拒绝连接"
+    elif [ "$ctl" = ok ] && [ "$rc" = 28 ]; then
+      ok "端口 $port 未能建立 TCP 连接（被过滤；对照端口正常）"
+    else
+      unk "端口 $port 无法判定：curl 退出码 $rc，未建立 TCP 连接"
+    fi
   done
 else
   skp "未提供 VPS 公网 IP：未检查端口暴露"
@@ -173,5 +193,5 @@ else
 fi
 
 echo
-echo "通过 $pass 项，失败 $fail 项，跳过 $skip 项（跳过不等于通过）"
-[ "$fail" -eq 0 ]
+echo "通过 $pass 项，失败 $fail 项，待确认 $unk 项，跳过 $skip 项（待确认和跳过都不等于通过）"
+[ "$fail" -eq 0 ] && [ "$unk" -eq 0 ]
