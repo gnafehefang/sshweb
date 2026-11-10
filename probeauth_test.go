@@ -225,3 +225,69 @@ func TestGeoIPOffByDefault(t *testing.T) {
 		t.Fatalf("默认不应进行国家识别, got %q", cc)
 	}
 }
+
+func TestChangeViewPassRevokesOldUnlocks(t *testing.T) {
+	e := newTestEnv(t, false)
+	addLockedProbe(t, e, "p1", "view-password-1")
+	w := do(e.public, http.MethodPost, "/api/probe/unlock", `{"id":"p1","pass":"view-password-1"}`, publicWrite())
+	if w.Code != 200 {
+		t.Fatalf("旧密码应能解锁: %d", w.Code)
+	}
+	var old *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		old = c
+	}
+	admin := loginCookie(t, e, "correct-horse-battery")
+
+	if w := do(e.admin, http.MethodPost, "/api/probes/viewpass", `{"id":"p1","viewPass":"view-password-2"}`, adminWrite()); w.Code != 401 {
+		t.Fatalf("未登录修改查看密码应 401, got %d", w.Code)
+	}
+	if w := do(e.admin, http.MethodPost, "/api/probes/viewpass", `{"id":"p1","viewPass":"short"}`, adminWrite(), cookie(admin)); w.Code != 400 {
+		t.Fatalf("过短的查看密码应 400, got %d", w.Code)
+	}
+	if w := do(e.admin, http.MethodPost, "/api/probes/viewpass", `{"id":"nope","viewPass":"view-password-2"}`, adminWrite(), cookie(admin)); w.Code != 404 {
+		t.Fatalf("不存在的探针应 404, got %d", w.Code)
+	}
+	if w := do(e.admin, http.MethodPost, "/api/probes/viewpass", `{"id":"p1","viewPass":"view-password-2"}`, adminWrite(), cookie(admin)); w.Code != 200 {
+		t.Fatalf("修改查看密码失败: %d %s", w.Code, w.Body.String())
+	}
+
+	if ps := publicProbes(t, e, cookie(old)); ps[0]["locked"] != true {
+		t.Fatal("改密码后，旧的解锁 Cookie 应失效")
+	}
+	if w := do(e.public, http.MethodPost, "/api/probe/unlock", `{"id":"p1","pass":"view-password-1"}`, publicWrite()); w.Code != 403 {
+		t.Fatalf("旧密码不应再能解锁, got %d", w.Code)
+	}
+	if w := do(e.public, http.MethodPost, "/api/probe/unlockpass", `{"pass":"view-password-1"}`, publicWrite(), remote("198.51.100.20:1")); w.Code != 403 {
+		t.Fatalf("旧密码不应再能通过 unlockpass 解锁, got %d", w.Code)
+	}
+	if w := do(e.public, http.MethodPost, "/api/probe/unlock", `{"id":"p1","pass":"view-password-2"}`, publicWrite()); w.Code != 200 {
+		t.Fatalf("新密码应能解锁, got %d", w.Code)
+	}
+}
+
+func TestSetViewPassMakesPublicProbeLocked(t *testing.T) {
+	e := newTestEnv(t, false)
+	if err := e.app.store.AddProbe(&Probe{ID: "pub1", Public: true}); err != nil {
+		t.Fatal(err)
+	}
+	e.app.probes.report("pub1", &probeStats{Hostname: "open-host", LastSeen: time.Now()})
+	if ps := publicProbes(t, e); ps[0]["locked"] == true || ps[0]["hostname"] != "open-host" {
+		t.Fatalf("公开探针初始应可见: %v", ps[0])
+	}
+	admin := loginCookie(t, e, "correct-horse-battery")
+	if w := do(e.admin, http.MethodPost, "/api/probes/viewpass", `{"id":"pub1","viewPass":"view-password-9"}`, adminWrite(), cookie(admin)); w.Code != 200 {
+		t.Fatalf("设置查看密码失败: %d", w.Code)
+	}
+	ps := publicProbes(t, e)
+	if ps[0]["locked"] != true {
+		t.Fatal("设置查看密码后应改为密码查看")
+	}
+	if _, ok := ps[0]["hostname"]; ok {
+		t.Fatal("改为密码查看后不应再下发主机名")
+	}
+	pr := e.app.store.ProbeByID("pub1")
+	if pr.Public || !strings.HasPrefix(pr.ViewPassHash, "$argon2id$") || pr.GrantVersion != 1 {
+		t.Fatalf("探针记录不正确: %+v", pr)
+	}
+}

@@ -2706,6 +2706,7 @@ function openAdmin() {
       <td>${pr.online ? '<span class="tag ok">在线</span>' : '<span class="tag bad">离线</span>'}${pr.enrolled === false ? ' <span class="tag">未注册</span>' : ''}${pr.legacyAgent ? ' <span class="tag bad">旧版 agent</span>' : ''}</td>
       <td><div class="row-actions">
         <button class="ic-btn" data-pact="view" title="查看状态">📊</button>
+        <button class="ic-btn" data-pact="viewpass" title="${pr.public ? '设置查看密码（改为密码查看）' : '修改查看密码（旧密码和已有解锁立即失效）'}">🔒</button>
         ${pr.public ? '' : '<button class="ic-btn" data-pact="revoke" title="撤销所有已解锁访客（需重新输入查看密码）">🔁</button>'}
         <button class="ic-btn" data-pact="rotate" title="重新生成安装命令（旧 agent 立即失效）">🔑</button>
         <button class="ic-btn danger" data-pact="del" title="移除探针">🗑</button>
@@ -2767,6 +2768,10 @@ function openAdmin() {
         try { showInstallModal(await api('api/probes/rotate', { method: 'POST', body: { id } })); } catch (e) { toast(e.message, 'err'); }
         return;
       }
+      if (b.dataset.pact === 'viewpass') {
+        openViewPassModal(state.probes.find(x => x.id === id) || { id });
+        return;
+      }
       if (b.dataset.pact === 'revoke') {
         if (!await uiConfirm('撤销所有已解锁这只探针的访客？他们需要重新输入查看密码。', { title: '撤销查看权限', okText: '撤销' })) return;
         try { await api('api/probes/revoke', { method: 'POST', body: { id } }); toast('已撤销'); } catch (e) { toast(e.message, 'err'); }
@@ -2800,6 +2805,36 @@ function openAdmin() {
       }
     };
   });
+}
+
+/* ---------- 设置 / 修改探针查看密码 ---------- */
+function openViewPassModal(pr) {
+  const isPub = !!pr.public;
+  openModal(`
+    <button class="modal-close">×</button>
+    <h2>🔒 ${isPub ? '设置查看密码' : '修改查看密码'}</h2>
+    <p class="confirm-msg">${isPub
+      ? '设置后这只探针改为“密码查看”，访客需要输入查看密码才能看到状态。'
+      : '保存后旧密码立即失效，所有已解锁的访客都需要用新密码重新解锁。'}</p>
+    <div class="field"><label>新的查看密码（至少 8 位）</label><input id="vpNew" type="password" autocomplete="new-password"></div>
+    <div class="modal-actions">
+      <button class="mc-btn" id="vpCancel">取消</button>
+      <button class="mc-btn" id="vpSave">保存</button>
+    </div>`);
+  attachPwToggle('#vpNew');
+  $('#vpCancel').onclick = () => openAdmin();
+  $('#vpSave').onclick = async () => {
+    const v = $('#vpNew').value;
+    if ([...v].length < 8) { toast('查看密码至少 8 位', 'err'); return; }
+    try {
+      await api('api/probes/viewpass', { method: 'POST', body: { id: pr.id, viewPass: v } });
+      toast(isPub ? '已改为密码查看' : '查看密码已更新，旧的解锁全部失效');
+      await fetchProbesNow();
+      if (farm.inited) syncProbeChickens();
+      farm.updateLabels(true);
+      openAdmin();
+    } catch (e) { toast(e.message, 'err'); }
+  };
 }
 
 /* ---------- AI Skill API Key 管理 ---------- */

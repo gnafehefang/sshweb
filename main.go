@@ -328,6 +328,7 @@ func (a *App) adminHandler() http.Handler {
 	m.HandleFunc("/api/probe/join", a.require(a.handleProbeJoin))
 	m.HandleFunc("/api/probes", a.require(a.handleProbes))
 	m.HandleFunc("/api/probes/revoke", a.require(a.handleProbeRevoke))
+	m.HandleFunc("/api/probes/viewpass", a.require(a.handleProbeViewPass))
 	m.HandleFunc("/api/probes/rotate", a.require(a.handleProbeRotate))
 	m.HandleFunc("/api/keys", a.require(a.handleAPIKeys))
 	m.HandleFunc("/api/admin/clearblocks", a.require(a.handleClearBlocks))

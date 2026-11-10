@@ -82,7 +82,8 @@ func do(h http.Handler, method, path, body string, opts ...reqOpt) *httptest.Res
 func TestPublicSiteHasNoAdminRoutes(t *testing.T) {
 	e := newTestEnv(t, true)
 	for _, p := range []string{"/api/login", "/api/logout", "/api/password", "/api/servers", "/api/servers/x/test",
-		"/ws/terminal", "/api/probe/join", "/api/probes", "/api/keys", "/api/admin/clearblocks"} {
+		"/ws/terminal", "/api/probe/join", "/api/probes", "/api/probes/revoke", "/api/probes/rotate", "/api/probes/viewpass",
+		"/api/keys", "/api/admin/clearblocks"} {
 		w := do(e.public, http.MethodPost, p, `{}`, hdr("Origin", testPublic), hdr("X-SSHWeb", "1"), hdr("Content-Type", "application/json"))
 		if w.Code != http.StatusNotFound {
 			t.Errorf("公开口 %s 应返回 404, got %d", p, w.Code)

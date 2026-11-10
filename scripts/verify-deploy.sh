@@ -83,7 +83,7 @@ else
 fi
 
 for p in /api/login /api/logout /api/password /api/servers /ws/terminal /api/probe/join /api/probes \
-         /api/probes/revoke /api/probes/rotate /api/keys /api/admin/clearblocks; do
+         /api/probes/revoke /api/probes/rotate /api/probes/viewpass /api/keys /api/admin/clearblocks; do
   req "公开站无管理路由 $p" 404 -X POST -H "Origin: $PUB" -H 'X-SSHWeb: 1' -H 'Content-Type: application/json' -d '{}' "$PUB$p"
 done
 req "解锁接口拒绝 GET" 405 "$PUB/api/probe/unlock?id=x&pass=y"

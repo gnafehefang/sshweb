@@ -272,6 +272,47 @@ func (a *App) handleProbeRevoke(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "grantVersion": pr.GrantVersion})
 }
 
+// POST /api/probes/viewpass {"id","viewPass"}（管理员）— 设置或修改查看密码。
+// 探针同时改为“密码查看”，权限版本号加 1：旧密码不再能解锁，已发出的解锁 Cookie 全部失效。
+func (a *App) handleProbeViewPass(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var in struct {
+		ID       string `json:"id"`
+		ViewPass string `json:"viewPass"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "请求格式错误"})
+		return
+	}
+	if len([]rune(in.ViewPass)) < minViewPassLen {
+		writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("查看密码至少 %d 位", minViewPassLen)})
+		return
+	}
+	if a.store.ProbeByID(in.ID) == nil { // 先确认存在，避免为无效 ID 计算哈希
+		writeJSON(w, 404, map[string]string{"error": errProbeNotFound.Error()})
+		return
+	}
+	h, err := hashPassword(in.ViewPass, viewArgon)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	pr, err := a.store.UpdateProbe(in.ID, func(p *Probe) error {
+		p.ViewPassHash, p.ViewPass = h, ""
+		p.Public = false
+		p.GrantVersion++
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, 404, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "grantVersion": pr.GrantVersion})
+}
+
 // ---------------- 隐私 ----------------
 
 // maskIP IPv4 只保留前两段，IPv6 只保留前 32 位；无法解析时不显示
