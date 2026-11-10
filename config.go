@@ -66,6 +66,10 @@ func parseOrigin(raw string, allowHTTP bool) (string, *url.URL, error) {
 	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", nil, errors.New("格式应为 https://host[:port]")
 	}
+	// 主机名只允许常规字符：这个值会被原样写进以 root 执行的安装脚本
+	if !validOriginHost(u.Hostname()) || (u.Port() != "" && !allDigits(u.Port())) {
+		return "", nil, errors.New("主机名只能包含字母、数字、点和连字符")
+	}
 	switch u.Scheme {
 	case "https":
 	case "http":
@@ -83,6 +87,30 @@ func parseOrigin(raw string, allowHTTP bool) (string, *url.URL, error) {
 		}
 	}
 	return u.Scheme + "://" + u.Host, u, nil
+}
+
+func allDigits(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
+func validOriginHost(h string) bool {
+	if h == "" {
+		return false
+	}
+	if a, err := netip.ParseAddr(h); err == nil {
+		return a.IsValid()
+	}
+	for _, c := range h {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func parseTrustedProxies(raw string) ([]netip.Prefix, error) {

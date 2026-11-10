@@ -38,8 +38,9 @@ type App struct {
 	// 管理密码失败计数：按来源 IP，以及全局兜底
 	loginFails       *failTracker
 	loginFailsGlobal *failTracker
-	unlockFails      *failTracker // 探针查看密码失败计数（按来源）
-	probeSigner      *probeSigner // 探针解锁 Cookie 签名
+	unlockFails      *failTracker  // 探针查看密码失败计数（按来源）
+	probeSigner      *probeSigner  // 探针解锁 Cookie 签名
+	enrollLimiter    *keyedLimiter // 注册码兑换频率（按来源）
 	pool             *sshx.Pool
 	upgrader         websocket.Upgrader
 	game             *gameHub
@@ -303,6 +304,7 @@ func (a *App) registerCommon(m *http.ServeMux) {
 func (a *App) publicHandler() http.Handler {
 	m := http.NewServeMux()
 	a.registerCommon(m)
+	m.HandleFunc("/api/probe/enroll", a.handleProbeEnroll)
 	m.HandleFunc("/api/probe/report", a.handleProbeReport)
 	m.HandleFunc("/api/probe/goodbye", a.handleProbeGoodbye)
 	m.HandleFunc("/api/probe/unlock", publicBrowserWrite(a.handleProbeUnlock))
@@ -326,6 +328,7 @@ func (a *App) adminHandler() http.Handler {
 	m.HandleFunc("/api/probe/join", a.require(a.handleProbeJoin))
 	m.HandleFunc("/api/probes", a.require(a.handleProbes))
 	m.HandleFunc("/api/probes/revoke", a.require(a.handleProbeRevoke))
+	m.HandleFunc("/api/probes/rotate", a.require(a.handleProbeRotate))
 	m.HandleFunc("/api/keys", a.require(a.handleAPIKeys))
 	m.HandleFunc("/api/admin/clearblocks", a.require(a.handleClearBlocks))
 	if a.cfg.EnableSSH {
@@ -350,10 +353,11 @@ func newApp(cfg *Config, store *Store) (*App, error) {
 		loginFails:       newFailTracker(5, 15*time.Minute, 15*time.Minute, 24*time.Hour),
 		loginFailsGlobal: newFailTracker(50, 10*time.Minute, 5*time.Minute, time.Hour),
 		// 每个来源 1 分钟内 5 次失败锁 1 分钟，之后翻倍，最长 1 小时
-		unlockFails: newFailTracker(5, time.Minute, time.Minute, time.Hour),
-		probeSigner: signer,
-		pool:        sshx.NewPool(),
-		upgrader:    websocket.Upgrader{CheckOrigin: wsOriginOK},
+		unlockFails:   newFailTracker(5, time.Minute, time.Minute, time.Hour),
+		probeSigner:   signer,
+		enrollLimiter: newKeyedLimiter(10.0/60, 10, 100000),
+		pool:          sshx.NewPool(),
+		upgrader:      websocket.Upgrader{CheckOrigin: wsOriginOK},
 	}
 	app.probes = newProbeRuntime()
 	app.game = newGameHub(store)

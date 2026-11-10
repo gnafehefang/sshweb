@@ -1,13 +1,11 @@
 package main
 
 // probe.go — 公开探针系统：
-//   管理端生成 token → 任意服务器 curl 一键安装 bash agent → 周期上报 CPU/内存/磁盘/网速
+//   管理员创建探针（一次性注册码，见 agent.go）→ 目标机一键安装 agent → 周期上报 CPU/内存/磁盘/网速
 //   农场里出现一只 📡 探针鸡，点击查看状态卡片
 //   支持：完全公开 / 密码查看（见 probeauth.go）/ IP 掩码
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,7 +19,9 @@ import (
 
 type Probe struct {
 	ID           string    `json:"id"`
-	Token        string    `json:"token"`
+	Token        string    `json:"token,omitempty"`        // 旧版明文 token，仅用于加载时迁移为哈希
+	TokenHash    string    `json:"tokenHash,omitempty"`    // agent 长期 token 的哈希；空 = 尚未注册
+	LegacyAgent  bool      `json:"legacyAgent,omitempty"`  // 最近一次以旧版 ?t= 方式上报
 	Name         string    `json:"name,omitempty"`         // 备注名；未解锁的访客看不到主机名
 	Public       bool      `json:"public"`                 // true=完全公开 false=密码查看
 	ViewPass     string    `json:"viewPass,omitempty"`     // 旧版明文，仅用于加载时迁移为哈希
@@ -92,6 +92,10 @@ func (a *App) probeView(pr *Probe, forAdmin bool, unlocked bool) map[string]any 
 		"public": pr.Public,
 		"online": online,
 	}
+	if forAdmin {
+		v["enrolled"] = pr.TokenHash != ""
+		v["legacyAgent"] = pr.LegacyAgent
+	}
 	if canSee {
 		if st != nil {
 			ip := st.IP
@@ -158,27 +162,24 @@ func (a *App) handleProbeJoin(w http.ResponseWriter, r *http.Request) {
 		}
 		viewHash = h
 	}
-	b := make([]byte, 16)
-	rand.Read(b)
 	pr := &Probe{
 		ID:           newID()[:12],
-		Token:        hex.EncodeToString(b),
 		Name:         cleanText(strings.TrimSpace(body.Name), 32),
 		Public:       body.Public,
 		ViewPassHash: viewHash,
 		MaskIP:       body.MaskIP,
 		CreatedAt:    time.Now(),
 	}
-	if err := a.store.AddProbe(pr); err != nil {
+	code, exp, err := a.store.AddProbeWithEnroll(pr, time.Now())
+	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "保存失败"})
 		return
 	}
-	// v0.5.0：全员无限材料，不再发每日探针奖励
-	base := a.cfg.PublicURL
 	writeJSON(w, 200, map[string]any{
 		"id":        pr.ID,
-		"install":   fmt.Sprintf("curl -fsSL '%s/probe/agent.sh?t=%s' | sudo bash", base, pr.Token),
-		"uninstall": fmt.Sprintf("curl -fsSL '%s/probe/uninstall.sh' | sudo bash", base),
+		"install":   a.installCommand(code),
+		"uninstall": a.uninstallCommand(),
+		"expiresAt": exp.Unix(),
 	})
 }
 
@@ -186,7 +187,6 @@ func (a *App) handleProbeJoin(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleProbes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		base := a.cfg.PublicURL
 		out := []map[string]any{}
 		for _, pr := range a.store.Probes() {
 			st := a.probes.get(pr.ID)
@@ -197,9 +197,10 @@ func (a *App) handleProbes(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, map[string]any{
 				"id": pr.ID, "name": name, "public": pr.Public, "maskIP": pr.MaskIP,
-				"online":    online,
-				"install":   fmt.Sprintf("curl -fsSL '%s/probe/agent.sh?t=%s' | sudo bash", base, pr.Token),
-				"createdAt": pr.CreatedAt,
+				"online":      online,
+				"enrolled":    pr.TokenHash != "",
+				"legacyAgent": pr.LegacyAgent,
+				"createdAt":   pr.CreatedAt,
 			})
 		}
 		writeJSON(w, 200, out)
@@ -213,17 +214,19 @@ func (a *App) handleProbes(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /api/probe/report?t=token — agent 上报
+// POST /api/probe/report — agent 上报（Authorization: Bearer swp_…）
 func (a *App) handleProbeReport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 		return
 	}
-	token := r.URL.Query().Get("t")
-	pr := a.store.ProbeByToken(token)
+	pr, legacy, msg := a.agentProbe(r)
 	if pr == nil {
-		writeJSON(w, 404, map[string]string{"error": "invalid token"})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": msg})
 		return
+	}
+	if legacy && !pr.LegacyAgent {
+		a.store.UpdateProbe(pr.ID, func(p *Probe) error { p.LegacyAgent = true; return nil })
 	}
 	// 同一探针两次上报至少间隔 2 秒（agent 约每 6 秒一次）
 	if prev := a.probes.get(pr.ID); prev != nil && time.Since(prev.LastSeen) < 2*time.Second {
@@ -285,159 +288,18 @@ func (a *App) handleProbesPublic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, a.probesForClient(forAdmin, unlocked))
 }
 
-// POST /api/probe/goodbye?t=token — 卸载时 agent 通知面板删除探针记录
+// POST /api/probe/goodbye — 卸载时 agent 通知面板删除探针记录
 func (a *App) handleProbeGoodbye(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("t")
-	pr := a.store.ProbeByToken(token)
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	pr, _, msg := a.agentProbe(r)
 	if pr == nil {
-		writeJSON(w, 404, map[string]string{"error": "invalid token"})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": msg})
 		return
 	}
 	a.store.DeleteProbe(pr.ID)
 	a.probes.remove(pr.ID)
 	writeJSON(w, 200, map[string]string{"ok": "1"})
-}
-
-/* ---------------- agent 安装/卸载脚本 ---------------- */
-
-func agentScript(base, token string) string {
-	return `#!/usr/bin/env bash
-# SSHWeb 农场探针 agent — 一键安装
-set -e
-PANEL="` + base + `"
-TOKEN="` + token + `"
-BIN=/usr/local/bin/sshweb-probe.sh
-UNIT=/etc/systemd/system/sshweb-probe.service
-
-cat > /etc/sshweb-probe.env <<ENVEOF
-PANEL="$PANEL"
-TOKEN="$TOKEN"
-ENVEOF
-chmod 600 /etc/sshweb-probe.env
-
-cat > "$BIN" <<'AGENT'
-#!/usr/bin/env bash
-PANEL="__PANEL__"
-TOKEN="__TOKEN__"
-prev_rx=0; prev_tx=0; prev_t=0
-num() { case "$1" in ''|*[!0-9.]*) echo 0;; *) echo "$1";; esac; }
-read_net() {
-  awk 'NR>2 {gsub(/:/," ",$1); rx+=$2; tx+=$10} END {print rx+0, tx+0}' /proc/net/dev
-}
-read_cpu() {
-  read -r _ u1 n1 s1 i1 w1 irq1 sirq1 st1 _ < /proc/stat
-  sleep 1
-  read -r _ u2 n2 s2 i2 w2 irq2 sirq2 st2 _ < /proc/stat
-  idle=$(( (i2 + w2) - (i1 + w1) ))
-  total=$(( (u2+n2+s2+i2+w2+irq2+sirq2+st2) - (u1+n1+s1+i1+w1+irq1+sirq1+st1) ))
-  if [ "$total" -le 0 ]; then echo 0; else echo $(( (100 * (total - idle)) / total )); fi
-}
-read_load() { awk '{print $1}' /proc/loadavg; }
-read_procs() { awk '/^procs_running/{r=$2} /^procs_blocked/{b=$2} END{print r+b}' /proc/stat; }
-read_uptime() { cut -d. -f1 /proc/uptime; }
-read_cpumodel() {
-  awk -F': ' '/^model name/{gsub(/"/,"",$2); print $2; exit}' /proc/cpuinfo
-}
-read_cores() { nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo; }
-CPU_MODEL=$(read_cpumodel | tr -d '"\\' | cut -c1-60)
-CPU_CORES=$(num "$(read_cores)")
-HOST=$(hostname | tr -d '"\\' | cut -c1-40)
-while true; do
-  cpu=$(read_cpu)
-  mem_total=$(awk '/^MemTotal:/{print $2+0}' /proc/meminfo)
-  mem_avail=$(awk '/^MemAvailable:/{print $2+0}' /proc/meminfo)
-  [ -z "$mem_avail" ] && mem_avail=$(awk '/^MemFree:/{print $2+0}' /proc/meminfo)
-  mem_used=$(( mem_total - mem_avail ))
-  [ "$mem_used" -lt 0 ] && mem_used=0
-  disk_total=$(df -P -k / 2>/dev/null | awk 'NR==2 {print $2+0}')
-  disk_used=$(df -P -k / 2>/dev/null | awk 'NR==2 {print $3+0}')
-  disk_total=$(num "$disk_total"); disk_used=$(num "$disk_used")
-  read -r rx tx < <(read_net)
-  rx=$(num "$rx"); tx=$(num "$tx")
-  load1=$(num "$(read_load)")
-  procs=$(num "$(read_procs)")
-  uptime_s=$(num "$(read_uptime)")
-  now=$(date +%s)
-  rx_rate=0; tx_rate=0
-  if [ "$prev_t" -gt 0 ]; then
-    dt=$(( now - prev_t ))
-    [ "$dt" -gt 0 ] && { rx_rate=$(( (rx - prev_rx) / dt )); tx_rate=$(( (tx - prev_tx) / dt )); }
-  fi
-  prev_rx=$rx; prev_tx=$tx; prev_t=$now
-  PAYLOAD="{\"hostname\":\"$HOST\",\"os\":\"$(uname -sr)\",\"cpu\":$cpu,\"memTotal\":$mem_total,\"memUsed\":$mem_used,\"diskTotal\":$disk_total,\"diskUsed\":$disk_used,\"rxRate\":$rx_rate,\"txRate\":$tx_rate,\"load1\":$load1,\"uptime\":$uptime_s,\"procs\":$procs,\"cpuModel\":\"$CPU_MODEL\",\"cpuCores\":$CPU_CORES}"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsS -m 8 -X POST "$PANEL/api/probe/report?t=$TOKEN" -H 'Content-Type: application/json' -d "$PAYLOAD" >/dev/null 2>&1 || true
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -T 8 -O /dev/null --post-data="$PAYLOAD" --header='Content-Type: application/json' "$PANEL/api/probe/report?t=$TOKEN" >/dev/null 2>&1 || true
-  fi
-  sleep 5
-done
-AGENT
-sed -i "s|__PANEL__|$PANEL|; s|__TOKEN__|$TOKEN|" "$BIN"
-chmod +x "$BIN"
-
-cat > "$UNIT" <<UNIT
-[Unit]
-Description=SSHWeb Farm Probe Agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=$BIN
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable sshweb-probe >/dev/null 2>&1
-systemctl restart sshweb-probe
-echo "✅ SSHWeb 探针已安装并启动（服务名 sshweb-probe）"
-echo "   卸载： curl -fsSL '$PANEL/probe/uninstall.sh' | sudo bash"
-`
-}
-
-const uninstallScript = `#!/usr/bin/env bash
-set -e
-BIN=/usr/local/bin/sshweb-probe.sh
-ENVF=/etc/sshweb-probe.env
-# 取面板地址与 token（新版读 env 文件；旧版 agent 直接从脚本里解析）
-PANEL=""; TOKEN=""
-if [ -f "$ENVF" ]; then
-  . "$ENVF"
-fi
-if [ -z "$TOKEN" ] && [ -f "$BIN" ]; then
-  PANEL=$(grep -oE 'PANEL="[^"]+"' "$BIN" | head -1 | sed 's/PANEL="//; s/"$//')
-  TOKEN=$(grep -oE 'TOKEN="[^"]+"' "$BIN" | head -1 | sed 's/TOKEN="//; s/"$//')
-fi
-systemctl disable --now sshweb-probe >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/sshweb-probe.service "$BIN" "$ENVF"
-systemctl daemon-reload
-# 通知面板删除探针记录（失败不阻塞，面板端也可在管理面板手动删除）
-if [ -n "$PANEL" ] && [ -n "$TOKEN" ]; then
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsS -m 8 -X POST "$PANEL/api/probe/goodbye?t=$TOKEN" >/dev/null 2>&1 || true
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -T 8 -O /dev/null --post-data="" "$PANEL/api/probe/goodbye?t=$TOKEN" >/dev/null 2>&1 || true
-  fi
-fi
-echo "🗑️ SSHWeb 探针已卸载（面板中的探针鸡将在几秒内消失）"
-`
-
-func (a *App) handleProbeAgentScript(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("t")
-	pr := a.store.ProbeByToken(token)
-	if pr == nil {
-		http.Error(w, "invalid token", 404)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, agentScript(a.cfg.PublicURL, token))
-}
-
-func (a *App) handleProbeUninstallScript(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, uninstallScript)
 }

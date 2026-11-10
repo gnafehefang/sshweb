@@ -2014,23 +2014,28 @@ async function openJoinModal() {
       const r = await api('api/probe/join', { method: 'POST', body: {
         public: isPub, viewPass: isPub ? '' : pass, maskIP: $('#pjMask').checked, name: $('#pjName').value.trim(),
       }});
-      openModal(`
-        <button class="modal-close">×</button>
-        <h2>📡 一键安装探针</h2>
-        <p class="confirm-msg">在目标服务器上以 root/sudo 执行：</p>
-        <div class="copybox" id="pjCmd">${esc(r.install)}</div>
-        <button class="mc-btn sm" id="pjCopy">📋 复制安装命令</button>
-        <p class="confirm-msg" style="margin-top:16px">卸载（随时在目标机执行）：</p>
-        <div class="copybox" id="pjRm">${esc(r.uninstall)}</div>
-        <button class="mc-btn sm" id="pjCopy2">📋 复制卸载命令</button>
-        <div class="notice">安装后 10 秒内农场会出现这只探针鸡。agent 是 systemd 服务 sshweb-probe，每 5 秒上报一次，纯 bash 无二进制依赖。</div>
-        <div class="modal-actions"><button class="mc-btn" id="pjDone">完成</button></div>`);
-      const copy = sel => { navigator.clipboard.writeText($(sel).textContent).then(() => toast('已复制')); };
-      $('#pjCopy').onclick = () => copy('#pjCmd');
-      $('#pjCopy2').onclick = () => copy('#pjRm');
-      $('#pjDone').onclick = () => { closeModal(); pollProbesOnce(); };
+      showInstallModal(r);
     } catch (e) { toast(e.message, 'err'); }
   };
+}
+/* 安装命令只在创建/轮换时显示一次（注册码 30 分钟内有效、只能用一次，面板只保存哈希） */
+function showInstallModal(r) {
+  const exp = r.expiresAt ? new Date(r.expiresAt * 1000).toLocaleTimeString() : '';
+  openModal(`
+    <button class="modal-close">×</button>
+    <h2>📡 一键安装探针</h2>
+    <p class="confirm-msg">在目标服务器上以 root/sudo 执行（含一次性注册码${exp ? '，' + esc(exp) + ' 前有效' : ''}，只能使用一次）：</p>
+    <div class="copybox" id="pjCmd">${esc(r.install)}</div>
+    <button class="mc-btn sm" id="pjCopy">📋 复制安装命令</button>
+    <p class="confirm-msg" style="margin-top:16px">卸载（随时在目标机执行）：</p>
+    <div class="copybox" id="pjRm">${esc(r.uninstall)}</div>
+    <button class="mc-btn sm" id="pjCopy2">📋 复制卸载命令</button>
+    <div class="notice">安装后 10 秒内农场会出现这只探针鸡。agent 以 systemd 服务 sshweb-probe 运行（无 root 权限），每 5 秒上报一次；需要 curl 7.55 及以上。注册码过期或丢失时，在管理面板对该探针点 🔑 重新生成。</div>
+    <div class="modal-actions"><button class="mc-btn" id="pjDone">完成</button></div>`);
+  const copy = sel => { navigator.clipboard.writeText($(sel).textContent).then(() => toast('已复制')); };
+  $('#pjCopy').onclick = () => copy('#pjCmd');
+  $('#pjCopy2').onclick = () => copy('#pjRm');
+  $('#pjDone').onclick = () => { closeModal(); pollProbesOnce(); };
 }
 async function pollProbesOnce() { await fetchProbesNow(); if (farm.inited) syncProbeChickens(); farm.updateLabels(true); }
 
@@ -2698,10 +2703,11 @@ function openAdmin() {
     return `<tr data-pid="${esc(pr.id)}">
       <td><b>📡 ${esc(nm)}</b><br><span class="mono">${esc(pr.hostname || '等待 agent 上报…')}${pr.ip ? ' · ' + esc(pr.ip) : ''}</span></td>
       <td>${pr.public ? '<span class="tag ok">公开</span>' : '<span class="tag">密码</span>'} ${pr.maskIP ? '<span class="tag">掩码</span>' : ''}</td>
-      <td>${pr.online ? '<span class="tag ok">在线</span>' : '<span class="tag bad">离线</span>'}</td>
+      <td>${pr.online ? '<span class="tag ok">在线</span>' : '<span class="tag bad">离线</span>'}${pr.enrolled === false ? ' <span class="tag">未注册</span>' : ''}${pr.legacyAgent ? ' <span class="tag bad">旧版 agent</span>' : ''}</td>
       <td><div class="row-actions">
         <button class="ic-btn" data-pact="view" title="查看状态">📊</button>
         ${pr.public ? '' : '<button class="ic-btn" data-pact="revoke" title="撤销所有已解锁访客（需重新输入查看密码）">🔁</button>'}
+        <button class="ic-btn" data-pact="rotate" title="重新生成安装命令（旧 agent 立即失效）">🔑</button>
         <button class="ic-btn danger" data-pact="del" title="移除探针">🗑</button>
       </div></td>
     </tr>`;
@@ -2755,6 +2761,11 @@ function openAdmin() {
       if (b.dataset.pact === 'view') {
         const pr = state.probes.find(x => x.id === id);
         closeModal(); openProbeCard(pr);
+      }
+      if (b.dataset.pact === 'rotate') {
+        if (!await uiConfirm('重新生成安装命令？当前 agent 的 token 会立即失效，需要在目标机重新执行安装命令。', { title: '轮换 token', okText: '重新生成', danger: true })) return;
+        try { showInstallModal(await api('api/probes/rotate', { method: 'POST', body: { id } })); } catch (e) { toast(e.message, 'err'); }
+        return;
       }
       if (b.dataset.pact === 'revoke') {
         if (!await uiConfirm('撤销所有已解锁这只探针的访客？他们需要重新输入查看密码。', { title: '撤销查看权限', okText: '撤销' })) return;

@@ -10,6 +10,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -142,6 +143,9 @@ func loadStore(dir string, opt storeOptions) (*Store, error) {
 	if err := s.migrateAPIKeys(); err != nil {
 		return fail(err)
 	}
+	if _, err := db.Exec(enrollSchema); err != nil {
+		return fail(err)
+	}
 
 	if enableSSH {
 		rows, err := db.Query("SELECT data FROM servers")
@@ -176,16 +180,21 @@ func loadStore(dir string, opt storeOptions) (*Store, error) {
 		}
 	}
 	rows2.Close()
-	// 旧版明文查看密码：转换为哈希后清空
+	// 旧版明文查看密码 / agent token：转换为哈希后清空
 	for _, pr := range s.ProbeList {
-		if pr.ViewPass == "" {
+		if pr.ViewPass == "" && pr.Token == "" {
 			continue
 		}
-		h, err := hashPassword(pr.ViewPass, viewArgon)
-		if err != nil {
-			return fail(err)
+		if pr.ViewPass != "" {
+			h, err := hashPassword(pr.ViewPass, viewArgon)
+			if err != nil {
+				return fail(err)
+			}
+			pr.ViewPassHash, pr.ViewPass = h, ""
 		}
-		pr.ViewPassHash, pr.ViewPass = h, ""
+		if pr.Token != "" {
+			pr.TokenHash, pr.Token = probeTokenHash(pr.Token), ""
+		}
 		if err := upsertJSON(db, "probes", "id", pr.ID, pr); err != nil {
 			return fail(err)
 		}
@@ -438,6 +447,7 @@ func (s *Store) DeleteProbe(id string) {
 		log.Printf("[store] 删除探针失败: %v", err)
 		return
 	}
+	s.db.Exec("DELETE FROM enroll_codes WHERE probe_id=?", id)
 	out := s.ProbeList[:0]
 	for _, v := range s.ProbeList {
 		if v.ID != id {
@@ -447,14 +457,15 @@ func (s *Store) DeleteProbe(id string) {
 	s.ProbeList = out
 }
 
-func (s *Store) ProbeByToken(token string) *Probe {
-	if token == "" {
+// ProbeByTokenHash 按 agent token 的哈希查找探针（库里不存明文 token）
+func (s *Store) ProbeByTokenHash(h string) *Probe {
+	if h == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, v := range s.ProbeList {
-		if v.Token == token {
+		if v.TokenHash != "" && subtle.ConstantTimeCompare([]byte(v.TokenHash), []byte(h)) == 1 {
 			return cloneProbe(v)
 		}
 	}

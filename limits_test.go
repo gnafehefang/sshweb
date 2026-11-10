@@ -184,14 +184,16 @@ func TestPlayerCapGivesEphemeralRecord(t *testing.T) {
 
 func TestProbeReportMinInterval(t *testing.T) {
 	e := newTestEnv(t, false)
-	if err := e.app.store.AddProbe(&Probe{ID: "p1", Token: "tok123", Public: true}); err != nil {
+	tok := "swp_" + strings.Repeat("ab", 32)
+	if err := e.app.store.AddProbe(&Probe{ID: "p1", TokenHash: probeTokenHash(tok), Public: true}); err != nil {
 		t.Fatal(err)
 	}
 	body := `{"hostname":"h\u0007ost","cpu":1}`
-	if w := do(e.public, http.MethodPost, "/api/probe/report?t=tok123", body); w.Code != 200 {
+	auth := hdr("Authorization", "Bearer "+tok)
+	if w := do(e.public, http.MethodPost, "/api/probe/report", body, auth); w.Code != 200 {
 		t.Fatalf("首次上报应成功: %d %s", w.Code, w.Body.String())
 	}
-	if w := do(e.public, http.MethodPost, "/api/probe/report?t=tok123", body); w.Code != http.StatusTooManyRequests {
+	if w := do(e.public, http.MethodPost, "/api/probe/report", body, auth); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("2 秒内再次上报应 429, got %d", w.Code)
 	}
 	if st := e.app.probes.get("p1"); st == nil || st.Hostname != "host" || st.IP != "192.0.2.10" {
