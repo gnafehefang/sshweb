@@ -15,9 +15,8 @@ async function api(path, opts = {}) {
     headers: opts.body ? { 'Content-Type': 'application/json', 'X-SSHWeb': '1' } : { 'X-SSHWeb': '1' },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
-  if (res.status === 401) throw new Error('未登录');
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) throw new Error(data.error || (res.status === 401 ? '未登录' : res.statusText));
   return data;
 }
 let toastTimer = 0;
@@ -2844,8 +2843,8 @@ function openPwModal() {
     <button class="modal-close">×</button>
     <h2>修改管理密码</h2>
     <div class="field"><label>原密码</label><input id="pwOld" type="password" autocomplete="current-password"></div>
-    <div class="field"><label>新密码（至少 6 位）</label><input id="pwNew" type="password" autocomplete="new-password"></div>
-    <div class="notice">密码保存在数据目录 data.json（0600）。</div>
+    <div class="field"><label>新密码（至少 12 位）</label><input id="pwNew" type="password" autocomplete="new-password"></div>
+    <div class="notice">管理密码只保存 Argon2id 哈希。修改后，其他设备上已登录的会话会全部失效。</div>
     <div class="modal-actions">
       <button class="mc-btn" id="mCancel">取消</button>
       <button class="mc-btn" id="mSave">保存</button>

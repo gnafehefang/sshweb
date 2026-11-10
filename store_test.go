@@ -7,6 +7,8 @@ import (
 	"testing"
 )
 
+const testPW = "correct-horse-battery"
+
 func TestStoreRefusesLegacyFiles(t *testing.T) {
 	for _, name := range legacyFiles {
 		dir := t.TempDir()
@@ -14,7 +16,7 @@ func TestStoreRefusesLegacyFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, ssh := range []bool{false, true} {
-			if _, err := loadStore(dir, ssh); err == nil || !strings.Contains(err.Error(), name) {
+			if _, err := loadStore(dir, storeOptions{EnableSSH: ssh, InitialPassword: testPW}); err == nil || !strings.Contains(err.Error(), name) {
 				t.Fatalf("存在 %s 时应拒绝启动 (ssh=%v), got %v", name, ssh, err)
 			}
 		}
@@ -26,7 +28,7 @@ func TestStoreRefusesLegacyFiles(t *testing.T) {
 
 func TestProbeModeRefusesServerRows(t *testing.T) {
 	dir := t.TempDir()
-	s, err := loadStore(dir, true)
+	s, err := loadStore(dir, storeOptions{EnableSSH: true, InitialPassword: testPW})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,10 +36,10 @@ func TestProbeModeRefusesServerRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Close()
-	if _, err := loadStore(dir, false); err == nil || !strings.Contains(err.Error(), "服务器记录") {
+	if _, err := loadStore(dir, storeOptions{InitialPassword: testPW}); err == nil || !strings.Contains(err.Error(), "服务器记录") {
 		t.Fatalf("探针模式遇到服务器记录应拒绝启动, got %v", err)
 	}
-	s2, err := loadStore(dir, true)
+	s2, err := loadStore(dir, storeOptions{EnableSSH: true, InitialPassword: testPW})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +50,7 @@ func TestProbeModeRefusesServerRows(t *testing.T) {
 }
 
 func TestProbeModeDoesNotLoadServers(t *testing.T) {
-	s, err := loadStore(t.TempDir(), false)
+	s, err := loadStore(t.TempDir(), storeOptions{InitialPassword: testPW})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +62,7 @@ func TestProbeModeDoesNotLoadServers(t *testing.T) {
 
 func TestRowLevelPersistence(t *testing.T) {
 	dir := t.TempDir()
-	s, err := loadStore(dir, false)
+	s, err := loadStore(dir, storeOptions{InitialPassword: testPW})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +79,7 @@ func TestRowLevelPersistence(t *testing.T) {
 	s.DeleteProbe("p1")
 	s.Close()
 
-	s2, err := loadStore(dir, false)
+	s2, err := loadStore(dir, storeOptions{InitialPassword: testPW})
 	if err != nil {
 		t.Fatal(err)
 	}

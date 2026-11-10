@@ -31,12 +31,11 @@ func newTestEnv(t *testing.T, ssh bool) *testEnv {
 	if ssh {
 		env["SSHWEB_ENABLE_SSH"] = "1"
 	}
-	t.Setenv("SSHWEB_PASSWORD", env["SSHWEB_PASSWORD"])
 	cfg, err := loadConfig(nil, envMap(env), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := loadStore(t.TempDir(), cfg.EnableSSH)
+	store, err := loadStore(t.TempDir(), storeOptions{EnableSSH: cfg.EnableSSH, InitialPassword: cfg.InitialPassword})
 	if err != nil {
 		t.Fatal(err)
 	}

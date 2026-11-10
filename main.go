@@ -2,17 +2,16 @@ package main
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/baiduxc/sshweb/internal/sshx"
@@ -31,48 +30,19 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// ---------------- 会话 ----------------
-
-type Sessions struct {
-	mu sync.Mutex
-	m  map[string]time.Time
-}
-
-func (ss *Sessions) valid(tok string) bool {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	exp, ok := ss.m[tok]
-	if !ok {
-		return false
-	}
-	if time.Now().After(exp) {
-		delete(ss.m, tok)
-		return false
-	}
-	ss.m[tok] = time.Now().Add(24 * time.Hour)
-	return true
-}
-
-func (ss *Sessions) newToken() string {
-	b := make([]byte, 24)
-	rand.Read(b)
-	tok := hex.EncodeToString(b)
-	ss.mu.Lock()
-	ss.m[tok] = time.Now().Add(24 * time.Hour)
-	ss.mu.Unlock()
-	return tok
-}
-
 // ---------------- HTTP ----------------
 
 type App struct {
 	cfg      *Config
 	store    *Store
 	sessions *Sessions
-	pool     *sshx.Pool
-	upgrader websocket.Upgrader
-	game     *gameHub
-	probes   *probeRuntime
+	// 管理密码失败计数：按来源 IP，以及全局兜底
+	loginFails       *failTracker
+	loginFailsGlobal *failTracker
+	pool             *sshx.Pool
+	upgrader         websocket.Upgrader
+	game             *gameHub
+	probes           *probeRuntime
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -86,8 +56,16 @@ func (a *App) authOK(r *http.Request) bool {
 	if !onAdminSite(r) {
 		return false
 	}
-	c, err := r.Cookie("sshweb_session")
-	return err == nil && a.sessions.valid(c.Value)
+	return a.sessions.valid(a.sessionToken(r))
+}
+
+// clientIP 请求来源 IP（后续提交改为识别可信反代）
+func (a *App) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // POST /api/admin/clearblocks — 清除全部方块（需管理员登录），并广播给所有在线客户端
@@ -115,66 +93,6 @@ func (a *App) require(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
-}
-
-func requestIsTLS(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-}
-
-func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, 400, map[string]string{"error": "请求格式错误"})
-		return
-	}
-	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(a.store.Password)) != 1 {
-		time.Sleep(500 * time.Millisecond)
-		writeJSON(w, 401, map[string]string{"error": "密码错误"})
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name: "sshweb_session", Value: a.sessions.newToken(), Path: "/", HttpOnly: true,
-		SameSite: http.SameSiteLaxMode, MaxAge: 86400, Secure: requestIsTLS(r),
-	})
-	writeJSON(w, 200, map[string]any{"ok": true})
-}
-
-func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", 405)
-		return
-	}
-	var in struct {
-		Old string `json:"old"`
-		New string `json:"new"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, 400, map[string]string{"error": "请求格式错误"})
-		return
-	}
-	if len(in.New) < 6 {
-		writeJSON(w, 400, map[string]string{"error": "新密码至少 6 位"})
-		return
-	}
-	if subtle.ConstantTimeCompare([]byte(in.Old), []byte(a.store.Password)) != 1 {
-		writeJSON(w, 401, map[string]string{"error": "原密码错误"})
-		return
-	}
-	if err := a.store.SetPassword(in.New); err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, 200, map[string]any{"ok": true})
-}
-
-func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: "sshweb_session", Value: "", Path: "/", MaxAge: -1})
-	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -298,6 +216,12 @@ func (a *App) handleTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.Close()
+	// 终端登记到会话名下：退出、改密码、会话过期时连接会被关闭
+	detach, ok := a.sessions.attach(a.sessionToken(r), func() { ws.Close() })
+	if !ok {
+		return
+	}
+	defer detach()
 	si := sv.ServerInfo()
 	if err := a.pool.Attach(ws, &si); err != nil {
 		log.Printf("terminal %s@%s: %v", sv.User, sv.Host, err)
@@ -370,9 +294,12 @@ func newApp(cfg *Config, store *Store) *App {
 	app := &App{
 		cfg:      cfg,
 		store:    store,
-		sessions: &Sessions{m: map[string]time.Time{}},
-		pool:     sshx.NewPool(),
-		upgrader: websocket.Upgrader{CheckOrigin: wsOriginOK},
+		sessions: newSessions(2*time.Hour, 12*time.Hour),
+		// 每个来源 5 次失败锁 15 分钟（之后翻倍，最长 24 小时）；全局 10 分钟内 50 次失败锁 5 分钟
+		loginFails:       newFailTracker(5, 15*time.Minute, 15*time.Minute, 24*time.Hour),
+		loginFailsGlobal: newFailTracker(50, 10*time.Minute, 5*time.Minute, time.Hour),
+		pool:             sshx.NewPool(),
+		upgrader:         websocket.Upgrader{CheckOrigin: wsOriginOK},
 	}
 	app.probes = newProbeRuntime()
 	app.game = newGameHub(store)
@@ -398,11 +325,12 @@ func main() {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		log.Fatal(err)
 	}
-	store, err := loadStore(cfg.DataDir, cfg.EnableSSH)
+	store, err := loadStore(cfg.DataDir, storeOptions{EnableSSH: cfg.EnableSSH, InitialPassword: cfg.InitialPassword})
 	if err != nil {
 		log.Fatalf("加载数据失败: %v", err)
 	}
 	app := newApp(cfg, store)
+	go app.sessions.janitor(time.Minute)
 
 	mode := "探针版（SSH 关闭）"
 	if cfg.EnableSSH {

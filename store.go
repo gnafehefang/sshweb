@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -59,7 +60,7 @@ type Store struct {
 	mu        sync.Mutex
 	db        *sql.DB
 	dir       string
-	Password  string
+	adminHash string // 管理密码的 Argon2id 哈希（PHC 格式）
 	Servers   []*Server
 	ProbeList []*Probe
 	Players   map[string]*FarmPlayer
@@ -105,7 +106,13 @@ func checkLegacyFiles(dir string) error {
 	return nil
 }
 
-func loadStore(dir string, enableSSH bool) (*Store, error) {
+type storeOptions struct {
+	EnableSSH       bool
+	InitialPassword string // 仅在库里还没有管理密码时使用
+}
+
+func loadStore(dir string, opt storeOptions) (*Store, error) {
+	enableSSH := opt.EnableSSH
 	if err := checkLegacyFiles(dir); err != nil {
 		return nil, err
 	}
@@ -113,7 +120,7 @@ func loadStore(dir string, enableSSH bool) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, dir: dir, Password: "admin888", Players: map[string]*FarmPlayer{}}
+	s := &Store{db: db, dir: dir, Players: map[string]*FarmPlayer{}}
 	fail := func(err error) (*Store, error) { db.Close(); return nil, err }
 
 	// 探针模式：库里只要有服务器记录就拒绝启动，保证公开实例从不持有 SSH 凭据。
@@ -128,17 +135,8 @@ func loadStore(dir string, enableSSH bool) (*Store, error) {
 		}
 	}
 
-	if v, err := s.metaGet("password"); err == nil && v != "" {
-		s.Password = v
-	} else {
-		if env := os.Getenv("SSHWEB_PASSWORD"); env != "" {
-			s.Password = env
-		} else {
-			log.Printf("[sshweb] 警告: 未设置 SSHWEB_PASSWORD，正在使用默认密码 admin888，请尽快在界面右上角修改")
-		}
-		if err := s.metaSet("password", s.Password); err != nil {
-			return fail(err)
-		}
+	if err := s.initAdminPassword(enableSSH, opt.InitialPassword); err != nil {
+		return fail(err)
 	}
 
 	if enableSSH {
@@ -485,13 +483,64 @@ func (s *Store) Touch(id string) {
 	}
 }
 
-func (s *Store) SetPassword(pw string) error {
+// initAdminPassword 管理密码只保存 Argon2id 哈希（meta.admin_pw）。
+//   - 旧版明文 meta.password：探针模式下视为旧数据卷，拒绝启动；SSH 模式下转成哈希后删除
+//   - 首次启动必须提供至少 12 位的初始密码，不再有默认密码
+func (s *Store) initAdminPassword(enableSSH bool, initial string) error {
+	hash, _ := s.metaGet("admin_pw")
+	legacy, _ := s.metaGet("password")
+	if legacy != "" {
+		if !enableSSH {
+			return errors.New("数据库中存在旧版明文管理密码，说明这是旧版数据卷。探针模式不使用旧数据：请改用全新的数据卷")
+		}
+		if hash == "" {
+			h, err := hashPassword(legacy, adminArgon)
+			if err != nil {
+				return err
+			}
+			if err := s.metaSet("admin_pw", h); err != nil {
+				return err
+			}
+			hash = h
+		}
+		if _, err := s.db.Exec("DELETE FROM meta WHERE k='password'"); err != nil {
+			return err
+		}
+		log.Printf("[store] 已把旧版明文管理密码转换为哈希。旧数据库文件、WAL 与备份中可能仍有明文残留，建议尽快修改管理密码")
+	}
+	if hash == "" {
+		if utf8.RuneCountInString(initial) < minAdminPasswordLen {
+			return fmt.Errorf("首次启动必须通过 SSHWEB_PASSWORD 设置管理密码（至少 %d 位）", minAdminPasswordLen)
+		}
+		h, err := hashPassword(initial, adminArgon)
+		if err != nil {
+			return err
+		}
+		if err := s.metaSet("admin_pw", h); err != nil {
+			return err
+		}
+		hash = h
+		log.Printf("[store] 管理密码已设置；可以从部署配置中删除 SSHWEB_PASSWORD")
+	} else if initial != "" {
+		log.Printf("[store] 已存在管理密码，忽略 SSHWEB_PASSWORD；请从部署配置中删除该变量")
+	}
+	s.adminHash = hash
+	return nil
+}
+
+func (s *Store) AdminHash() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.metaSet("password", pw); err != nil {
+	return s.adminHash
+}
+
+func (s *Store) SetAdminHash(h string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.metaSet("admin_pw", h); err != nil {
 		return err
 	}
-	s.Password = pw
+	s.adminHash = h
 	return nil
 }
 
