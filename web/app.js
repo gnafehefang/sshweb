@@ -11,7 +11,8 @@ async function api(path, opts = {}) {
   const res = await fetch('/' + path.replace(/^\//, ''), {
     method: opts.method || 'GET',
     credentials: 'same-origin',
-    headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
+    // X-SSHWeb：服务端用它和 Origin 一起做 CSRF 校验
+    headers: opts.body ? { 'Content-Type': 'application/json', 'X-SSHWeb': '1' } : { 'X-SSHWeb': '1' },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   if (res.status === 401) throw new Error('未登录');
@@ -121,6 +122,9 @@ const state = {
   servers: [], statuses: new Map(), chickenHP: new Map(), probeHP: new Map(),
   probes: [],
   me: null, admin: false, players: new Map(),
+  adminSite: false, // 当前是否在管理站（公开站上没有任何管理功能）
+  ssh: false,       // 管理站是否开启了网页 SSH
+
   myHP: { hp: playerMaxHP, down: false },
   inv: { dirt: 0, wood: 0, stone: 0 },
   materials: 0,
@@ -131,6 +135,8 @@ async function init() {
   let sess = null;
   try { sess = await api('api/session'); } catch (e) { sess = null; }
   state.admin = !!(sess && sess.loggedIn);
+  state.adminSite = !!(sess && sess.adminSite);
+  state.ssh = !!(sess && sess.ssh);
   enterFarm();
 }
 function enterFarm() {
@@ -144,6 +150,7 @@ function enterFarm() {
   if (state.admin) loadAdminData();
 }
 async function loadAdminData() {
+  if (!state.ssh) { state.servers = []; farm.syncChickens(); return; }
   try {
     state.servers = await api('api/servers');
     farm.syncChickens();
@@ -198,20 +205,25 @@ $('#renameBtn').onclick = () => {
 };
 function openLoginModal() {
   exitPointerLock();
+  const adminField = state.adminSite
+    ? '<div class="field"><label>管理密码</label><input id="lmPass" type="password" autocomplete="current-password"></div>'
+    : '<input id="lmPass" type="hidden" value="">';
   openModal(`
     <button class="modal-close">×</button>
-    <h2>🔑 登录</h2>
-    <p class="confirm-msg">管理密码：升级为农场主，可连终端、养新鸡。<br>探针查看密码：解锁你部署的密码探针鸡（游客身份即可查看）。</p>
-    <div class="field"><label>管理密码</label><input id="lmPass" type="password" autocomplete="current-password"></div>
+    <h2>${state.adminSite ? '🔑 登录' : '🔒 解锁探针'}</h2>
+    <p class="confirm-msg">${state.adminSite ? '管理密码：升级为农场主，管理探针与农场。<br>' : ''}探针查看密码：解锁密码保护的探针鸡（游客身份即可查看）。</p>
+    ${adminField}
     <div class="field"><label>探针查看密码（可选）</label><input id="lmProbePass" type="password" placeholder="解锁密码探针"></div>
     <div id="lmErr" class="mc-err hidden"></div>
     <div class="modal-actions">
       <button class="mc-btn" id="lmCancel">继续当游客</button>
       <button class="mc-btn" id="lmOk">登录</button>
     </div>`);
-  attachPwToggle('#lmPass'); attachPwToggle('#lmProbePass');
+  if (state.adminSite) attachPwToggle('#lmPass');
+  attachPwToggle('#lmProbePass');
   $('#lmCancel').onclick = closeModal;
   $('#lmPass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#lmOk').click(); });
+  $('#lmProbePass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#lmOk').click(); });
   $('#lmOk').onclick = async () => {
     const err = $('#lmErr');
     err.classList.add('hidden');
@@ -228,7 +240,7 @@ function openLoginModal() {
         await api('api/login', { method: 'POST', body: { password: pw } });
         state.admin = true;
         setMyModel(true);
-        toast('已登录管理 · 可以打开终端了');
+        toast(state.ssh ? '已登录管理 · 可以打开终端了' : '已登录管理');
         connectGame(true);
         await loadAdminData();
         did = true;
@@ -1971,7 +1983,7 @@ function openProbeCard(pr) {
       <div class="pstat"><label>硬盘</label><div class="pbar"><i style="width:${diskPct}%"></i></div><b>${fmtKB(fresh.diskUsed)} / ${fmtKB(fresh.diskTotal)} (${diskPct}%)</b></div>
       <div class="pstat"><label>网速</label><div class="pnet"><span>↓ ${fmtRate(fresh.rxRate)}</span><span>↑ ${fmtRate(fresh.txRate)}</span></div></div>
     </div>
-    <div class="notice">探针只有统计功能，没有 SSH 能力。任何人都可以在右上角「📡 加入」部署自己的探针。</div>
+    <div class="notice">探针只有统计功能，没有 SSH 能力。</div>
     <div class="modal-actions"><button class="mc-btn" id="pbClose">关闭</button></div>`);
   $('#pbClose').onclick = closeModal;
 }
@@ -1982,8 +1994,8 @@ async function openJoinModal() {
   exitPointerLock();
   openModal(`
     <button class="modal-close">×</button>
-    <h2>📡 部署公开探针</h2>
-    <p class="confirm-msg">任何人都可以部署！生成一键安装命令，在任意 Linux 服务器执行后，农场里会多一只探针鸡，头顶实时显示状态。探针只有统计功能，没有 SSH 权限。</p>
+    <h2>📡 部署探针</h2>
+    <p class="confirm-msg">生成一键安装命令，在 Linux 服务器上执行后，农场里会多一只探针鸡，头顶实时显示状态。探针只有统计功能，没有 SSH 权限。</p>
     <div class="field"><label>备注名（可选，默认用主机名）</label><input id="pjName" type="text" placeholder="如 日本探针"></div>
     <div class="field"><label>可见性</label>
       <select id="pjPublic">
@@ -2486,7 +2498,8 @@ function buildHotbar() {
   }
 }
 function updateHud() {
-  $('#adminBtn').textContent = state.admin ? '☰ 管理 (E)' : '🔑 登录';
+  $('#adminBtn').textContent = state.admin ? '☰ 管理 (E)' : (state.adminSite ? '🔑 登录' : '🔒 解锁探针');
+  $('#joinBtn').style.display = state.admin ? '' : 'none'; // 部署探针仅限管理员
   $('#logoutBtn').style.display = state.admin ? '' : 'none';
   $('#renameBtn').style.display = state.admin ? 'none' : '';
   updateStatsPanel();
@@ -2715,19 +2728,19 @@ function openAdmin() {
     <button class="modal-close">×</button>
     <h2>🐔 农场管理</h2>
     <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
-      <button class="mc-btn sm" id="admAdd">+ 添加服务器（新鸡）</button>
+      ${state.ssh ? '<button class="mc-btn sm" id="admAdd">+ 添加服务器（新鸡）</button>' : ''}
       <button class="mc-btn sm" id="admJoin">📡 部署公开探针</button>
       <button class="mc-btn sm" id="admKeys">🤖 AI Skill API Key</button>
       <button class="mc-btn sm" id="admPw">修改管理密码</button>
       <button class="mc-btn sm danger" id="admClear" style="background:#a33;border-color:#822">🧹 清除所有方块</button>
     </div>
-    ${state.servers.length ? `<table class="sv-table">
+    ${!state.ssh ? '' : state.servers.length ? `<table class="sv-table">
       <thead><tr><th>服务器</th><th>区域</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
       <tbody>${rows}</tbody></table>` : '<div class="notice">农场还没有鸡。点「添加服务器」引入第一只。</div>'}
     ${probeRows ? `<h3 style="margin:18px 0 8px;font-size:.9rem">📡 公开探针</h3>
     <table class="sv-table"><thead><tr><th>探针</th><th>可见性</th><th>状态</th><th style="text-align:right">操作</th></tr></thead><tbody>${probeRows}</tbody></table>` : ''}
   `);
-  $('#admAdd').onclick = () => openForm(null);
+  if (state.ssh) $('#admAdd').onclick = () => openForm(null);
   $('#admJoin').onclick = () => openJoinModal();
   $('#admKeys').onclick = () => openKeysModal();
   $('#admPw').onclick = openPwModal;

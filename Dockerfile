@@ -17,8 +17,10 @@ COPY --from=build /out/sshweb /app/sshweb
 RUN mkdir -p /data && chown sshweb:sshweb /data
 USER sshweb
 VOLUME ["/data"]
-EXPOSE 45678
-# 首次启动的管理密码；已存在数据目录时以 SQLite(sshweb.db) 为准
-ENV SSHWEB_PASSWORD=""
+# 45678 公开口（农场/探针），45679 管理口（只应映射到宿主机回环地址，经私有网关访问）
+EXPOSE 45678 45679
+# 默认探针版：不开启网页 SSH，不加载任何 SSH 凭据
+ENV SSHWEB_ENABLE_SSH=0
 ENTRYPOINT ["/app/sshweb"]
-CMD ["-listen", ":45678", "-data", "/data"]
+# 容器内必须监听 0.0.0.0，访问范围由宿主机侧端口映射（127.0.0.1:...）限制
+CMD ["-listen", "0.0.0.0:45678", "-admin-listen", "0.0.0.0:45679", "-data", "/data"]

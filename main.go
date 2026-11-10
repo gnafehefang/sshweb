@@ -81,7 +81,11 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// authOK 只在管理口上可能为 true；公开口一律视为游客
 func (a *App) authOK(r *http.Request) bool {
+	if !onAdminSite(r) {
+		return false
+	}
 	c, err := r.Cookie("sshweb_session")
 	return err == nil && a.sessions.valid(c.Value)
 }
@@ -174,7 +178,12 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleSession(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"loggedIn": a.authOK(r), "version": version})
+	writeJSON(w, 200, map[string]any{
+		"loggedIn":  a.authOK(r),
+		"version":   version,
+		"adminSite": onAdminSite(r),
+		"ssh":       a.cfg.EnableSSH && onAdminSite(r),
+	})
 }
 
 func sanitize(s *Server) map[string]any {
@@ -303,6 +312,84 @@ func (s *Server) ServerInfo() sshx.ServerInfo {
 	}
 }
 
+// 两个监听口共用的路由：静态页、会话状态、农场/探针的公开视图、游戏 WS
+func (a *App) registerCommon(m *http.ServeMux) {
+	m.HandleFunc("/api/session", a.handleSession)
+	m.HandleFunc("/ws/game", a.handleGameWS)
+	m.HandleFunc("/api/farm/public", a.handleFarmPublic)
+	m.HandleFunc("/api/probes/public", a.handleProbesPublic)
+
+	webFS, _ := fs.Sub(embeddedWeb, "web")
+	fileServer := http.FileServer(http.FS(webFS))
+	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 静态资源一律协商缓存：浏览器/CDN 每次回源验证（304 无流量），
+		// 避免升级后用户拿到旧 JS（曾导致生产环境缓存 4 小时旧版）
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		fileServer.ServeHTTP(w, r)
+	})
+}
+
+// publicHandler 公开口：只有农场展示、探针上报/解锁、安装脚本与 Skill 接口，没有任何管理路由
+func (a *App) publicHandler() http.Handler {
+	m := http.NewServeMux()
+	a.registerCommon(m)
+	m.HandleFunc("/api/probe/report", a.handleProbeReport)
+	m.HandleFunc("/api/probe/goodbye", a.handleProbeGoodbye)
+	m.HandleFunc("/api/probe/unlock", a.handleProbeUnlock)
+	m.HandleFunc("/api/probe/unlockpass", a.handleProbeUnlockPass)
+	m.HandleFunc("/probe/agent.sh", a.handleProbeAgentScript)
+	m.HandleFunc("/probe/uninstall.sh", a.handleProbeUninstallScript)
+	m.HandleFunc("/api/skill/blocks", a.handleSkillBlocks)
+	m.HandleFunc("/api/skill/player", a.handleSkillPlayer)
+	m.HandleFunc("/api/skill/state", a.handleSkillState)
+	st := &site{admin: false, origin: a.cfg.PublicOrigin}
+	return withSite(st, m)
+}
+
+// adminHandler 管理口：全部管理路由；/api/* 统一经过 Origin/CSRF 校验
+func (a *App) adminHandler() http.Handler {
+	m := http.NewServeMux()
+	a.registerCommon(m)
+	m.HandleFunc("/api/login", a.handleLogin)
+	m.HandleFunc("/api/logout", a.require(a.handleLogout))
+	m.HandleFunc("/api/password", a.require(a.handleChangePassword))
+	m.HandleFunc("/api/probe/join", a.require(a.handleProbeJoin))
+	m.HandleFunc("/api/probes", a.require(a.handleProbes))
+	m.HandleFunc("/api/keys", a.require(a.handleAPIKeys))
+	m.HandleFunc("/api/admin/clearblocks", a.require(a.handleClearBlocks))
+	if a.cfg.EnableSSH {
+		m.HandleFunc("/api/servers", a.require(a.handleServers))
+		m.HandleFunc("/api/servers/", a.require(a.handleServerOne))
+		m.HandleFunc("/ws/terminal", a.handleTerminal)
+	}
+	st := &site{admin: true, origin: a.cfg.AdminOrigin}
+	return withSite(st, adminAPIGuard(st, m))
+}
+
+func newApp(cfg *Config, store *Store) *App {
+	app := &App{
+		cfg:      cfg,
+		store:    store,
+		sessions: &Sessions{m: map[string]time.Time{}},
+		pool:     sshx.NewPool(),
+		upgrader: websocket.Upgrader{CheckOrigin: wsOriginOK},
+	}
+	app.probes = newProbeRuntime()
+	app.game = newGameHub(store)
+	app.game.probeRT = app.probes
+	return app
+}
+
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
 func main() {
 	cfg, err := loadConfig(os.Args[1:], os.Getenv, os.Stderr)
 	if err != nil {
@@ -311,63 +398,26 @@ func main() {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		log.Fatal(err)
 	}
-
 	store, err := loadStore(cfg.DataDir, cfg.EnableSSH)
 	if err != nil {
 		log.Fatalf("加载数据失败: %v", err)
 	}
-	app := &App{
-		cfg:      cfg,
-		store:    store,
-		sessions: &Sessions{m: map[string]time.Time{}},
-		pool:     sshx.NewPool(),
-		upgrader: websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
-	}
-	app.probes = newProbeRuntime()
-	app.game = newGameHub(store)
-	app.game.probeRT = app.probes
+	app := newApp(cfg, store)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/login", app.handleLogin)
-	mux.HandleFunc("/api/logout", app.require(app.handleLogout))
-	mux.HandleFunc("/api/password", app.require(app.handleChangePassword))
-	mux.HandleFunc("/api/session", app.handleSession)
-	if cfg.EnableSSH {
-		mux.HandleFunc("/api/servers", app.require(app.handleServers))
-		mux.HandleFunc("/api/servers/", app.require(app.handleServerOne))
-		mux.HandleFunc("/ws/terminal", app.handleTerminal)
-	}
-	mux.HandleFunc("/ws/game", app.handleGameWS)
-	mux.HandleFunc("/api/farm/public", app.handleFarmPublic)
-	mux.HandleFunc("/api/probe/join", app.handleProbeJoin)
-	mux.HandleFunc("/api/probes", app.require(app.handleProbes))
-	mux.HandleFunc("/api/probe/report", app.handleProbeReport)
-	mux.HandleFunc("/api/probe/goodbye", app.handleProbeGoodbye)
-	mux.HandleFunc("/api/probe/unlock", app.handleProbeUnlock)
-	mux.HandleFunc("/api/probe/unlockpass", app.handleProbeUnlockPass)
-	mux.HandleFunc("/api/probes/public", app.handleProbesPublic)
-	mux.HandleFunc("/api/keys", app.require(app.handleAPIKeys))
-	mux.HandleFunc("/api/admin/clearblocks", app.require(app.handleClearBlocks))
-	mux.HandleFunc("/api/skill/blocks", app.handleSkillBlocks)
-	mux.HandleFunc("/api/skill/player", app.handleSkillPlayer)
-	mux.HandleFunc("/api/skill/state", app.handleSkillState)
-	mux.HandleFunc("/probe/agent.sh", app.handleProbeAgentScript)
-	mux.HandleFunc("/probe/uninstall.sh", app.handleProbeUninstallScript)
-
-	webFS, _ := fs.Sub(embeddedWeb, "web")
-	fileServer := http.FileServer(http.FS(webFS))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// 静态资源一律协商缓存：浏览器/CDN 每次回源验证（304 无流量），
-		// 避免升级后用户拿到旧 JS（曾导致生产环境缓存 4 小时旧版）
-		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
-		fileServer.ServeHTTP(w, r)
-	})
-
-	srv := &http.Server{Addr: cfg.Listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	mode := "探针版（SSH 关闭）"
 	if cfg.EnableSSH {
 		mode = "SSH 已开启"
 	}
-	fmt.Printf("SSHWeb v%s · %s · 监听 %s · 数据 %s\n", version, mode, cfg.Listen, cfg.DataDir)
-	log.Fatal(srv.ListenAndServe())
+	fmt.Printf("SSHWeb v%s · %s · 数据 %s\n", version, mode, cfg.DataDir)
+	fmt.Printf("  公开口 %s → %s\n", cfg.Listen, cfg.PublicOrigin)
+
+	errc := make(chan error, 2)
+	go func() { errc <- newHTTPServer(cfg.Listen, app.publicHandler()).ListenAndServe() }()
+	if cfg.AdminListen != "" {
+		fmt.Printf("  管理口 %s → %s\n", cfg.AdminListen, cfg.AdminOrigin)
+		go func() { errc <- newHTTPServer(cfg.AdminListen, app.adminHandler()).ListenAndServe() }()
+	} else {
+		fmt.Println("  管理口未启用")
+	}
+	log.Fatal(<-errc)
 }

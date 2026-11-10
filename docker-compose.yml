@@ -1,15 +1,50 @@
+# SSHWeb（fork）探针版部署示例
+#   - 镜像从本仓库构建，不拉取上游 latest
+#   - 公开口只给宿主机上的反代（Caddy/Nginx 提供 HTTPS）
+#   - 管理口只给宿主机上的私有网关（推荐 tailscale serve，勿用 Funnel）
+#   - 使用全新的具名数据卷，不要挂载任何旧版数据卷
+# 注意：Docker 发布的端口会绕过 ufw，端口映射里必须写明 127.0.0.1，并从外网实际扫描确认。
 services:
   sshweb:
-    image: ghcr.io/baiduxc/sshweb:latest
+    build: .
+    image: sshweb-fork:0.6.0
     container_name: sshweb
-    restart: unless-stopped
-    ports:
-      - "45678:45678"
+    command: ["-listen", "0.0.0.0:45678", "-admin-listen", "0.0.0.0:45679", "-data", "/data"]
     environment:
-      # 首次启动的管理密码；改密码后以数据卷里的 SQLite(sshweb.db) 为准
+      SSHWEB_ENABLE_SSH: "0"
+      SSHWEB_PUBLIC_URL: "https://farm.example.com"            # 改成你的公开站域名
+      SSHWEB_ADMIN_ORIGIN: "https://vps.your-tailnet.ts.net"   # 改成 tailscale serve 给出的地址
+      # 经端口映射进入容器时的来源地址（下方网络的网关）；以容器内实际看到的地址为准
+      SSHWEB_TRUSTED_PROXIES: "172.30.10.1"
+      # 仅首次启动需要（至少 12 位）；启动成功后从这里删除
       SSHWEB_PASSWORD: ${SSHWEB_PASSWORD:-}
+    ports:
+      - "127.0.0.1:45678:45678"   # 宿主机反代 → 公开口
+      - "127.0.0.1:45679:45679"   # 宿主机 tailscale serve → 管理口
+    networks: [sshweb]
     volumes:
-      - sshweb-data:/data
+      - sshweb-probe-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+networks:
+  sshweb:
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24
 
 volumes:
-  sshweb-data:
+  sshweb-probe-data:

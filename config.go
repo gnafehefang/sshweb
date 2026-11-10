@@ -75,6 +75,13 @@ func parseOrigin(raw string, allowHTTP bool) (string, *url.URL, error) {
 	default:
 		return "", nil, errors.New("只支持 http/https")
 	}
+	// 浏览器发送的 Origin 不带默认端口，这里同样去掉，便于逐字比较
+	if (u.Scheme == "https" && u.Port() == "443") || (u.Scheme == "http" && u.Port() == "80") {
+		u.Host = u.Hostname()
+		if strings.Contains(u.Host, ":") { // IPv6 字面量
+			u.Host = "[" + u.Host + "]"
+		}
+	}
 	return u.Scheme + "://" + u.Host, u, nil
 }
 
