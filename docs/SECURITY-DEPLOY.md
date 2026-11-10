@@ -198,7 +198,7 @@ sudo gzip -t "$B" && sudo tar tzf "$B" | grep -qx './sshweb.db' && echo "备份�
 sudo scripts/restore-backup.sh "$B" --check-only
 ```
 
-恢复用仓库自带的 `scripts/restore-backup.sh`。它任何一步失败都会立即退出，原数据卷始终不改动：
+恢复用仓库自带的 `scripts/restore-backup.sh`。检查阶段任何一步失败都会立即退出，原数据卷始终不改动、不删除：
 
 ```bash
 cd /opt/sshweb
@@ -206,17 +206,22 @@ sudo scripts/restore-backup.sh /root/backup/sshweb-2026-11-10.tgz --check-only  
 sudo scripts/restore-backup.sh /root/backup/sshweb-2026-11-10.tgz                # 检查通过后询问是否切换
 ```
 
-脚本依次执行：
+脚本用一次性 alpine 容器运行 sqlite、jq 和 yq（需要能拉取 `alpine` 镜像并访问 Alpine 软件源），宿主机不需要安装这些工具。依次执行：
 
 1. 校验压缩包完整、包含 `./sshweb.db`、没有绝对路径或 `..`。
-2. 从运行中的容器读出镜像、当前数据卷和应用运行用户。
+2. 从运行中的容器读出镜像、当前数据卷和应用运行用户；确认 `docker compose config` 里的数据卷就是容器正在挂载的卷，并且该卷没有自定义驱动参数（有则拒绝，请手动恢复）。
 3. 解压到一个新数据卷（不碰原卷）。
 4. 检查新卷里所有文件的属主都是应用运行用户。
-5. 把新卷内容复制到临时目录后**正常打开**数据库（会应用 WAL），检查 `integrity_check`、管理密码哈希、探针 Cookie 签名密钥、没有旧版明文密码；探针模式下还要求没有服务器记录；并列出恢复卷与当前卷各表的行数供核对。
-6. 你输入 `yes` 后，写入 `docker-compose.override.yml` 切换到新卷并重建容器；容器 5 秒内没有正常运行就自动退回原配置。
+5. 把新卷内容复制到临时目录后**正常打开**数据库（会应用 WAL），检查 `integrity_check`；当前版本必需的 8 张表及其列必须齐全，缺表、缺列或任何查询出错都失败退出；还要求有管理密码哈希和探针 Cookie 签名密钥、没有旧版明文密码，探针模式下没有服务器记录。最后列出恢复卷与当前卷各表的行数供核对。
+6. 你输入 `yes` 后切换：
+   - 只改 `docker-compose.override.yml` 里 `sshweb-probe-data` 卷这一项（mikefarah/yq 修改，注释和其他配置保留），原文件另存为 `docker-compose.override.yml.bak-<时间>`；原本没有 override 时新建一个只含该卷的文件。
+   - 改动前后各执行一次 `docker compose config` 比对：除这个卷以外出现任何差异，或改动后卷没有指向新卷，就拒绝并恢复原文件，容器不动。比对只在内存里进行，只报告有差异的配置路径，不打印取值。
+   - 重建容器；5 秒后要求容器处于运行状态、没有重启过、挂载的是新卷。
+
+从改动 override 开始，任何命令失败、检查不通过或被中断（Ctrl-C、`kill`、终端断开），脚本都会恢复原 override、重建容器，并确认容器回到原卷；确认不了时明确报错并给出手动步骤。回滚过程中不再响应 Ctrl-C。`kill -9` 或断电无法自动处理，这时按下面的退回步骤手动操作。
 
 不要用 `immutable=1` 方式检查：它不读取 WAL，`docker compose stop` 之后的数据可能全部还在 WAL 里。
-验收通过前保留原卷；要退回，删除（或恢复备份的）`docker-compose.override.yml` 后执行 `sudo docker compose up -d --force-recreate sshweb`。
+验收通过前保留原卷；要退回，用脚本打印的 `.bak-<时间>` 文件覆盖 `docker-compose.override.yml`（原本没有 override 就删除它），再执行 `sudo docker compose up -d --force-recreate sshweb`。
 
 探针版的库中没有 SSH 凭据，但包含管理密码哈希、探针 Cookie 签名密钥和各类 token 哈希，备份仍应妥善保管。
 
