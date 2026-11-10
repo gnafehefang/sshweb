@@ -52,6 +52,7 @@ type Server struct {
 	KeyPass    string    `json:"keyPass,omitempty"`
 	Note       string    `json:"note,omitempty"`
 	Region     string    `json:"region,omitempty"`
+	HostKey    string    `json:"hostKey,omitempty"` // 已确认的主机公钥（阶段 3 启用校验）；连接目标变化时清空
 	LastUsed   time.Time `json:"lastUsed,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
 }
@@ -136,6 +137,9 @@ func loadStore(dir string, opt storeOptions) (*Store, error) {
 	}
 
 	if err := s.initAdminPassword(enableSSH, opt.InitialPassword); err != nil {
+		return fail(err)
+	}
+	if err := s.migrateAPIKeys(); err != nil {
 		return fail(err)
 	}
 
@@ -470,11 +474,21 @@ func (s *Store) ProbeByID(id string) *Probe {
 
 // ---------------- 服务器 ----------------
 
+// 服务器读取一律返回副本：调用方修改副本不会影响内存中的记录，
+// 只有 Put 写库成功后才替换（修复“校验失败但内存已被改动”的问题）
+
+func cloneServer(v *Server) *Server {
+	c := *v
+	return &c
+}
+
 func (s *Store) List() []*Server {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*Server, len(s.Servers))
-	copy(out, s.Servers)
+	for i, v := range s.Servers {
+		out[i] = cloneServer(v)
+	}
 	return out
 }
 
@@ -483,29 +497,33 @@ func (s *Store) Get(id string) *Server {
 	defer s.mu.Unlock()
 	for _, v := range s.Servers {
 		if v.ID == id {
-			return v
+			return cloneServer(v)
 		}
 	}
 	return nil
 }
 
+// Put 原子提交：先写库，事务成功后才替换内存；失败时内存保持不变
 func (s *Store) Put(sv *Server) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	next := cloneServer(sv)
+	idx := -1
 	for i, v := range s.Servers {
-		if v.ID == sv.ID {
-			sv.CreatedAt, sv.LastUsed = v.CreatedAt, v.LastUsed
-			if err := upsertJSON(s.db, "servers", "id", sv.ID, sv); err != nil {
-				return err
-			}
-			s.Servers[i] = sv
-			return nil
+		if v.ID == next.ID {
+			idx = i
+			next.CreatedAt, next.LastUsed = v.CreatedAt, v.LastUsed
+			break
 		}
 	}
-	if err := upsertJSON(s.db, "servers", "id", sv.ID, sv); err != nil {
+	if err := upsertJSON(s.db, "servers", "id", next.ID, next); err != nil {
 		return err
 	}
-	s.Servers = append(s.Servers, sv)
+	if idx >= 0 {
+		s.Servers[idx] = next
+	} else {
+		s.Servers = append(s.Servers, next)
+	}
 	return nil
 }
 

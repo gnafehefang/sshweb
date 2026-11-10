@@ -7,7 +7,8 @@ package main
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -19,15 +20,64 @@ import (
 )
 
 // ---------------- API Key 存储 ----------------
+// 库里只存 key 的哈希与前缀；完整 key 只在创建时返回一次。
 
 type APIKey struct {
-	Key       string `json:"key"`
+	ID        string `json:"id"`
+	Prefix    string `json:"prefix"`
 	Name      string `json:"name"`
 	CreatedAt string `json:"createdAt"`
 }
 
+const apiKeySchema = `CREATE TABLE IF NOT EXISTS apikeys_v2(
+	id TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL, name TEXT, created_at TEXT)`
+
+func apiKeyHash(key string) string {
+	h := sha256.Sum256([]byte("sshweb/apikey/v1|" + key))
+	return hex.EncodeToString(h[:])
+}
+
+func apiKeyPrefix(key string) string {
+	if len(key) > 10 {
+		return key[:10]
+	}
+	return key
+}
+
+// migrateAPIKeys 建新表，并把旧表中的明文 key 转成哈希后删除
+func (s *Store) migrateAPIKeys() error {
+	if _, err := s.db.Exec(apiKeySchema); err != nil {
+		return err
+	}
+	rows, err := s.db.Query("SELECT key,name,created_at FROM apikeys")
+	if err != nil {
+		return err
+	}
+	type old struct{ key, name, created string }
+	var olds []old
+	for rows.Next() {
+		var o old
+		var name, created sql.NullString
+		if rows.Scan(&o.key, &name, &created) == nil {
+			o.name, o.created = name.String, created.String
+			olds = append(olds, o)
+		}
+	}
+	rows.Close()
+	for _, o := range olds {
+		if _, err := s.db.Exec("INSERT OR IGNORE INTO apikeys_v2(id,hash,prefix,name,created_at) VALUES(?,?,?,?,?)",
+			newID(), apiKeyHash(o.key), apiKeyPrefix(o.key), o.name, o.created); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec("DELETE FROM apikeys WHERE key=?", o.key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) APIKeys() []APIKey {
-	rows, err := s.db.Query("SELECT key,name,created_at FROM apikeys ORDER BY created_at")
+	rows, err := s.db.Query("SELECT id,prefix,name,created_at FROM apikeys_v2 ORDER BY created_at")
 	if err != nil {
 		return nil
 	}
@@ -35,34 +85,42 @@ func (s *Store) APIKeys() []APIKey {
 	var out []APIKey
 	for rows.Next() {
 		var k APIKey
-		if rows.Scan(&k.Key, &k.Name, &k.CreatedAt) == nil {
+		var name, created sql.NullString
+		if rows.Scan(&k.ID, &k.Prefix, &name, &created) == nil {
+			k.Name, k.CreatedAt = name.String, created.String
 			out = append(out, k)
 		}
 	}
 	return out
 }
 
-func (s *Store) AddAPIKey(name string) (APIKey, error) {
+// AddAPIKey 生成新 key，返回元数据与完整 key（只此一次）
+func (s *Store) AddAPIKey(name string) (APIKey, string, error) {
 	b := make([]byte, 20)
 	if _, err := rand.Read(b); err != nil {
-		return APIKey{}, err
+		return APIKey{}, "", err
 	}
-	k := APIKey{Key: "sw_" + hex.EncodeToString(b), Name: name, CreatedAt: time.Now().Format(time.RFC3339)}
-	_, err := s.db.Exec("INSERT INTO apikeys(key,name,created_at) VALUES(?,?,?)", k.Key, k.Name, k.CreatedAt)
-	return k, err
+	key := "sw_" + hex.EncodeToString(b)
+	k := APIKey{ID: newID(), Prefix: apiKeyPrefix(key), Name: name, CreatedAt: time.Now().Format(time.RFC3339)}
+	_, err := s.db.Exec("INSERT INTO apikeys_v2(id,hash,prefix,name,created_at) VALUES(?,?,?,?,?)",
+		k.ID, apiKeyHash(key), k.Prefix, k.Name, k.CreatedAt)
+	return k, key, err
 }
 
-func (s *Store) DeleteAPIKey(key string) {
-	s.db.Exec("DELETE FROM apikeys WHERE key=?", key)
+func (s *Store) DeleteAPIKey(id string) {
+	s.db.Exec("DELETE FROM apikeys_v2 WHERE id=?", id)
 }
 
-func (s *Store) HasAPIKey(key string) bool {
-	if key == "" {
-		return false
+// APIKeyID 按哈希查找 key，返回其 ID（用于限流分桶）
+func (s *Store) APIKeyID(key string) (string, bool) {
+	if !strings.HasPrefix(key, "sw_") || len(key) > 128 {
+		return "", false
 	}
-	var n int
-	s.db.QueryRow("SELECT COUNT(*) FROM apikeys WHERE key=?", key).Scan(&n)
-	return n > 0
+	var id string
+	if err := s.db.QueryRow("SELECT id FROM apikeys_v2 WHERE hash=?", apiKeyHash(key)).Scan(&id); err != nil {
+		return "", false
+	}
+	return id, true
 }
 
 // ---------------- 限速（每 key 2000 ops/s 令牌桶） ----------------
@@ -109,16 +167,7 @@ func (r *rateLimiter) take(key string, n int) bool {
 // ---------------- Skill HTTP API ----------------
 
 func (a *App) skillAuth(r *http.Request) (string, bool) {
-	key := r.Header.Get("X-API-Key")
-	if key == "" {
-		return "", false
-	}
-	for _, k := range a.store.APIKeys() {
-		if subtle.ConstantTimeCompare([]byte(k.Key), []byte(key)) == 1 {
-			return k.Key, true
-		}
-	}
-	return "", false
+	return a.store.APIKeyID(r.Header.Get("X-API-Key"))
 }
 
 func (a *App) skillGuard(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -251,20 +300,20 @@ func (a *App) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": "名称太长"})
 			return
 		}
-		k, err := a.store.AddAPIKey(name)
+		k, full, err := a.store.AddAPIKey(name)
 		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			writeJSON(w, 500, map[string]string{"error": "保存失败"})
 			return
 		}
-		// 完整 key 只在创建时返回一次
-		writeJSON(w, 200, map[string]any{"ok": true, "key": k.Key, "name": k.Name, "createdAt": k.CreatedAt})
+		// 完整 key 只在创建时返回一次，库里只存哈希
+		writeJSON(w, 200, map[string]any{"ok": true, "id": k.ID, "key": full, "name": k.Name, "createdAt": k.CreatedAt})
 	case http.MethodDelete:
-		key := r.URL.Query().Get("key")
-		if key == "" {
-			writeJSON(w, 400, map[string]string{"error": "need key"})
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeJSON(w, 400, map[string]string{"error": "need id"})
 			return
 		}
-		a.store.DeleteAPIKey(key)
+		a.store.DeleteAPIKey(id)
 		writeJSON(w, 200, map[string]any{"ok": true})
 	default:
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})

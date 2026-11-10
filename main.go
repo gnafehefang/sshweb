@@ -114,56 +114,110 @@ func (a *App) handleServers(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, out)
 	case http.MethodPost:
-		var in struct {
-			ID, Name, Host, User, AuthKind, Password, PrivateKey, KeyPass, Note, Region string
-			Port                                                                        int
-		}
+		var in serverInput
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			writeJSON(w, 400, map[string]string{"error": "请求格式错误"})
 			return
 		}
-		if in.Name == "" || in.Host == "" || in.User == "" {
-			writeJSON(w, 400, map[string]string{"error": "名称、主机、用户名必填"})
+		next, code, msg := buildServer(a.store.Get(in.ID), in, time.Now())
+		if code != 0 {
+			writeJSON(w, code, map[string]string{"error": msg})
 			return
 		}
-		if in.Port <= 0 || in.Port > 65535 {
-			in.Port = 22
-		}
-		if in.AuthKind != "key" {
-			in.AuthKind = "password"
-		}
-		sv := a.store.Get(in.ID)
-		if sv == nil {
-			sv = &Server{ID: newID(), CreatedAt: time.Now()}
-		}
-		sv.Name, sv.Host, sv.Port, sv.User, sv.AuthKind, sv.Note, sv.Region = in.Name, in.Host, in.Port, in.User, in.AuthKind, in.Note, strings.TrimSpace(in.Region)
-		if in.Password != "" {
-			sv.Password = in.Password
-		}
-		if in.PrivateKey != "" {
-			sv.PrivateKey, sv.KeyPass = in.PrivateKey, in.KeyPass
-		}
-		if sv.AuthKind == "password" && sv.Password == "" {
-			writeJSON(w, 400, map[string]string{"error": "请填写登录密码"})
+		if err := a.store.Put(next); err != nil {
+			writeJSON(w, 500, map[string]string{"error": "保存失败"})
 			return
 		}
-		if sv.AuthKind == "key" && sv.PrivateKey == "" {
-			writeJSON(w, 400, map[string]string{"error": "请粘贴 SSH 私钥"})
-			return
-		}
-		if err := a.store.Put(sv); err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, sanitize(sv))
+		writeJSON(w, 200, sanitize(next))
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
 }
 
+type serverInput struct {
+	ID, Name, Host, User, AuthKind, Password, PrivateKey, KeyPass, Note, Region string
+	Port                                                                        int
+}
+
+// buildServer 在副本上应用编辑并完成全部校验；返回非 0 的 code 表示拒绝，此时原记录未被改动。
+//   - 修改 Host/Port/User 或切换认证方式时，必须提供当前认证方式的新凭据
+//   - 切换认证方式时清空旧方式的凭据字段
+//   - 连接目标变化时清除已确认的主机密钥
+func buildServer(old *Server, in serverInput, now time.Time) (*Server, int, string) {
+	in.Name, in.Host, in.User = strings.TrimSpace(in.Name), strings.TrimSpace(in.Host), strings.TrimSpace(in.User)
+	in.Region, in.Note = strings.TrimSpace(in.Region), strings.TrimSpace(in.Note)
+	if in.Name == "" || in.Host == "" || in.User == "" {
+		return nil, 400, "名称、主机、用户名必填"
+	}
+	if len([]rune(in.Name)) > 64 || len(in.Host) > 253 || len(in.User) > 64 || len([]rune(in.Region)) > 32 || len([]rune(in.Note)) > 200 {
+		return nil, 400, "字段过长"
+	}
+	if strings.ContainsAny(in.Host, " \t\r\n/@") || strings.ContainsAny(in.User, " \t\r\n") {
+		return nil, 400, "主机或用户名包含非法字符"
+	}
+	if in.Port == 0 {
+		in.Port = 22
+	}
+	if in.Port < 1 || in.Port > 65535 {
+		return nil, 400, "端口范围 1-65535"
+	}
+	if in.AuthKind != "key" {
+		in.AuthKind = "password"
+	}
+	if in.ID != "" && old == nil {
+		return nil, 404, "服务器不存在"
+	}
+
+	var next Server
+	if old != nil {
+		next = *old
+	} else {
+		next = Server{ID: newID(), CreatedAt: now}
+	}
+	isNew := old == nil
+	targetChanged := !isNew && (old.Host != in.Host || old.Port != in.Port || old.User != in.User)
+	authChanged := !isNew && old.AuthKind != in.AuthKind
+	needSecret := isNew || targetChanged || authChanged
+
+	switch in.AuthKind {
+	case "password":
+		if needSecret && in.Password == "" {
+			if isNew {
+				return nil, 400, "请填写登录密码"
+			}
+			return nil, 400, "修改主机/端口/用户或认证方式时，必须重新填写登录密码"
+		}
+		next.PrivateKey, next.KeyPass = "", ""
+		if in.Password != "" {
+			next.Password = in.Password
+		}
+	case "key":
+		if needSecret && in.PrivateKey == "" {
+			if isNew {
+				return nil, 400, "请粘贴 SSH 私钥"
+			}
+			return nil, 400, "修改主机/端口/用户或认证方式时，必须重新粘贴 SSH 私钥"
+		}
+		next.Password = ""
+		if in.PrivateKey != "" {
+			next.PrivateKey, next.KeyPass = in.PrivateKey, in.KeyPass
+		}
+	}
+	if targetChanged {
+		next.HostKey = ""
+	}
+	next.Name, next.Host, next.Port, next.User, next.AuthKind = in.Name, in.Host, in.Port, in.User, in.AuthKind
+	next.Note, next.Region = in.Note, in.Region
+	return &next, 0, ""
+}
+
 func (a *App) handleServerOne(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/servers/")
 	if strings.HasSuffix(path, "/test") {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
 		id := strings.TrimSuffix(path, "/test")
 		sv := a.store.Get(id)
 		if sv == nil {

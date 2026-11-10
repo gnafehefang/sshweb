@@ -2795,11 +2795,10 @@ function openAdmin() {
 async function openKeysModal() {
   let keys = [];
   try { keys = await api('api/keys'); } catch (e) {}
-  const rows = keys.map(k => `<tr data-key="${esc(k.key)}">
-    <td><b>${esc(k.name)}</b><br><span class="mono">${esc(k.key.slice(0, 10))}…${esc(k.key.slice(-6))}</span></td>
+  const rows = keys.map(k => `<tr data-kid="${esc(k.id)}">
+    <td><b>${esc(k.name)}</b><br><span class="mono">${esc(k.prefix)}…</span></td>
     <td class="mono">${esc((k.createdAt || '').slice(0, 10))}</td>
     <td><div class="row-actions">
-      <button class="ic-btn" data-kact="copy" title="复制完整 Key">📋</button>
       <button class="ic-btn danger" data-kact="del" title="删除">🗑</button>
     </div></td>
   </tr>`).join('');
@@ -2822,18 +2821,15 @@ async function openKeysModal() {
       box.classList.remove('hidden');
       box.innerHTML = `✅ 已生成（只显示这一次，请立即保存）：<b class="mono">${esc(r.key)}</b> <button class="mc-btn sm" id="akCopyNew">📋 复制</button>`;
       $('#akCopyNew').onclick = () => navigator.clipboard.writeText(r.key).then(() => toast('已复制'));
-      setTimeout(() => openKeysModal(), 100);
+      // 完整 key 只显示这一次：不再自动刷新列表，避免把它从界面上冲掉
     } catch (e) { toast(e.message, 'err'); }
   };
   $$('#modal [data-kact]').forEach(b => {
     b.onclick = async () => {
-      const key = b.closest('tr').dataset.key;
-      if (b.dataset.kact === 'copy') {
-        try { await navigator.clipboard.writeText(key); toast('已复制完整 Key'); } catch (e) { toast('复制失败', 'err'); }
-      }
+      const kid = b.closest('tr').dataset.kid;
       if (b.dataset.kact === 'del') {
         if (!await uiConfirm('删除这个 API Key？使用它的 AI Agent 将立即失去建造权限。', { title: '删除 Key', okText: '删除', danger: true })) return;
-        await api('api/keys?key=' + encodeURIComponent(key), { method: 'DELETE' });
+        await api('api/keys?id=' + encodeURIComponent(kid), { method: 'DELETE' });
         toast('已删除');
         openKeysModal();
       }
@@ -2883,13 +2879,13 @@ function openForm(s) {
         <select id="fAuth"><option value="password" ${!isKey ? 'selected' : ''}>密码</option><option value="key" ${isKey ? 'selected' : ''}>SSH 私钥</option></select>
       </div>
     </div>
-    <div class="field" id="boxPw"><label>登录密码</label><input id="fPass" type="password" placeholder="${s ? '留空则保持原密码' : 'SSH 登录密码'}" autocomplete="new-password"></div>
+    <div class="field" id="boxPw"><label>登录密码</label><input id="fPass" type="password" placeholder="${s ? '留空保持原密码；改主机/端口/用户或认证方式时必须重填' : 'SSH 登录密码'}" autocomplete="new-password"></div>
     <div class="field hidden" id="boxKey">
       <label>私钥（PEM）</label><textarea id="fKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
       <div class="hint">仅支持 OpenSSH / PEM 格式</div>
     </div>
     <div class="field hidden" id="boxKeyPass"><label>私钥口令（可选）</label><input id="fKeyPass" type="password" autocomplete="new-password"></div>
-    <div class="notice">凭据以 0600 权限保存在面板本机 data.json；列表接口不会下发密码与私钥。游客只能看到鸡的名字。</div>
+    <div class="notice">建议使用专用低权限账户和独立私钥。凭据保存在面板数据库中，列表接口不会下发密码与私钥。</div>
     <div class="modal-actions">
       <button class="mc-btn" id="mCancel">取消</button>
       <button class="mc-btn" id="mSave">保存</button>
