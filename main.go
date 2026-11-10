@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -57,15 +56,6 @@ func (a *App) authOK(r *http.Request) bool {
 		return false
 	}
 	return a.sessions.valid(a.sessionToken(r))
-}
-
-// clientIP 请求来源 IP（后续提交改为识别可信反代）
-func (a *App) clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 // POST /api/admin/clearblocks — 清除全部方块（需管理员登录），并广播给所有在线客户端

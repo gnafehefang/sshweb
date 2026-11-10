@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 type Probe struct {
@@ -172,7 +174,7 @@ func (a *App) handleProbeJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// v0.5.0：全员无限材料，不再发每日探针奖励
-	base := requestBaseURL(r)
+	base := a.cfg.PublicURL
 	writeJSON(w, 200, map[string]any{
 		"id":        pr.ID,
 		"install":   fmt.Sprintf("curl -fsSL '%s/probe/agent.sh?t=%s' | sudo bash", base, pr.Token),
@@ -184,7 +186,7 @@ func (a *App) handleProbeJoin(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleProbes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		base := requestBaseURL(r)
+		base := a.cfg.PublicURL
 		out := []map[string]any{}
 		for _, pr := range a.store.Probes() {
 			st := a.probes.get(pr.ID)
@@ -223,6 +225,11 @@ func (a *App) handleProbeReport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "invalid token"})
 		return
 	}
+	// 同一探针两次上报至少间隔 2 秒（agent 约每 6 秒一次）
+	if prev := a.probes.get(pr.ID); prev != nil && time.Since(prev.LastSeen) < 2*time.Second {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too frequent"})
+		return
+	}
 	var body struct {
 		Hostname  string  `json:"hostname"`
 		OS        string  `json:"os"`
@@ -244,24 +251,31 @@ func (a *App) handleProbeReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.probes.report(pr.ID, &probeStats{
-		Hostname: truncate(body.Hostname, 40), OS: truncate(body.OS, 40),
-		IP:  gameClientIP(r),
+		Hostname: cleanText(body.Hostname, 40), OS: cleanText(body.OS, 40),
+		IP:  a.clientIP(r),
 		CPU: body.CPU, MemTotal: body.MemTotal, MemUsed: body.MemUsed,
 		DiskTotal: body.DiskTotal, DiskUsed: body.DiskUsed,
 		RxRate: body.RxRate, TxRate: body.TxRate,
 		Load1: body.Load1, Uptime: body.Uptime, Procs: body.Procs,
-		CPUModel: truncate(body.CPUModel, 60), CPUCores: body.CPUCores,
+		CPUModel: cleanText(body.CPUModel, 60), CPUCores: body.CPUCores,
 		LastSeen: time.Now(),
 	})
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) > n {
-		return string(r[:n])
+// cleanText 去掉控制字符并按字符数截断（上报内容会展示给访客）
+func cleanText(s string, n int) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r == utf8.RuneError || unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			continue
+		}
+		out = append(out, r)
+		if len(out) >= n {
+			break
+		}
 	}
-	return s
+	return string(out)
 }
 
 // GET /probe/unlock?id=&pass= — 游客密码解锁探针查看
@@ -340,18 +354,6 @@ func (a *App) handleProbeGoodbye(w http.ResponseWriter, r *http.Request) {
 	a.store.DeleteProbe(pr.ID)
 	a.probes.remove(pr.ID)
 	writeJSON(w, 200, map[string]string{"ok": "1"})
-}
-
-func requestBaseURL(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		scheme = "https"
-	}
-	host := r.Host
-	if h := r.Header.Get("X-Forwarded-Host"); h != "" {
-		host = h
-	}
-	return scheme + "://" + host
 }
 
 /* ---------------- agent 安装/卸载脚本 ---------------- */
@@ -490,7 +492,7 @@ func (a *App) handleProbeAgentScript(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, agentScript(requestBaseURL(r), token))
+	fmt.Fprint(w, agentScript(a.cfg.PublicURL, token))
 }
 
 func (a *App) handleProbeUninstallScript(w http.ResponseWriter, r *http.Request) {

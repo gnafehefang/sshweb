@@ -284,6 +284,9 @@ func (s *Store) ColumnTop(x, z int) int {
 
 // ---------------- 玩家 ----------------
 
+// maxPlayers 持久化的游客档案上限；超出后新访客只拿到不落盘的临时档案
+var maxPlayers = 5000
+
 func (s *Store) GetOrCreatePlayer(ip string) *FarmPlayer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -292,6 +295,11 @@ func (s *Store) GetOrCreatePlayer(ip string) *FarmPlayer {
 	}
 	if p, ok := s.Players[ip]; ok {
 		return p
+	}
+	if len(s.Players) >= maxPlayers {
+		b := make([]byte, 2)
+		crand.Read(b)
+		return &FarmPlayer{ID: newID()[:10], Name: fmt.Sprintf("访客-%x", b), IP: ip}
 	}
 	b := make([]byte, 2)
 	crand.Read(b)

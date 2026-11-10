@@ -38,10 +38,19 @@ type gameClient struct {
 	IP          string
 	adminKey    string
 	lastPosSave time.Time
-	conn        *websocket.Conn
-	send        chan []byte
-	hub         *gameHub
-	once        sync.Once
+
+	// 每连接限流（只在 readPump 串行访问）
+	msgBucket   localBucket
+	blockBucket localBucket
+	dropped     int
+	droppedAt   time.Time
+	// 刚挖掉的 TNT：explode 只接受与之对应的坐标
+	tntX, tntY, tntZ int
+	tntAt            time.Time
+	conn             *websocket.Conn
+	send             chan []byte
+	hub              *gameHub
+	once             sync.Once
 }
 
 type playerHPState struct {
@@ -61,6 +70,52 @@ type gameHub struct {
 	store    *Store
 	probeRT  *probeRuntime
 	limiter  *rateLimiter
+
+	ipConns     map[string]int // 每个 IP 当前的游戏连接数
+	totalConns  int
+	connLimiter *keyedLimiter // 每个 IP 的建连频率
+}
+
+// 游戏 WS 配额
+const (
+	maxGameConnsPerIP = 3
+	maxGameConnsTotal = 500
+	gameMsgRate       = 30 // 每连接每秒消息数
+	gameMsgBurst      = 60
+	gameBlockRate     = 10 // 方块/爆炸类消息每秒
+	gameBlockBurst    = 20
+	gameDropClose     = 300 // 10 秒内被丢弃的消息超过此数则断开
+)
+
+// acquireConn 为某 IP 占用一个游戏连接名额
+func (h *gameHub) acquireConn(ip string) (ok bool, reason string) {
+	if !h.connLimiter.allow(ip) {
+		return false, "连接过于频繁"
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.totalConns >= maxGameConnsTotal {
+		return false, "在线人数已满"
+	}
+	if h.ipConns[ip] >= maxGameConnsPerIP {
+		return false, "同一地址连接数过多"
+	}
+	h.ipConns[ip]++
+	h.totalConns++
+	return true, ""
+}
+
+func (h *gameHub) releaseConn(ip string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ipConns[ip] <= 1 {
+		delete(h.ipConns, ip)
+	} else {
+		h.ipConns[ip]--
+	}
+	if h.totalConns > 0 {
+		h.totalConns--
+	}
 }
 
 func newGameHub(store *Store) *gameHub {
@@ -69,6 +124,8 @@ func newGameHub(store *Store) *gameHub {
 		probeHP: map[string]*chickenState{}, playerHP: map[string]*playerHPState{},
 		lastPos: map[string][3]float64{},
 		store:   store, limiter: &rateLimiter{},
+		ipConns:     map[string]int{},
+		connLimiter: newKeyedLimiter(10.0/60, 10, 100000),
 	}
 }
 
@@ -326,8 +383,30 @@ func (c *gameClient) readPump() {
 		if json.Unmarshal(data, &m) != nil {
 			continue
 		}
+		if !c.allowMsg(m["t"]) {
+			now := time.Now()
+			if now.Sub(c.droppedAt) > 10*time.Second {
+				c.dropped, c.droppedAt = 0, now
+			}
+			c.dropped++
+			if c.dropped > gameDropClose {
+				return // 持续超限：断开
+			}
+			continue
+		}
 		c.hub.handle(c, m)
 	}
+}
+
+// allowMsg 每连接限流：所有消息共享一个桶，方块/爆炸类再额外限一个桶
+func (c *gameClient) allowMsg(t any) bool {
+	if !c.msgBucket.allow() {
+		return false
+	}
+	if t == "block" || t == "explode" {
+		return c.blockBucket.allow()
+	}
+	return true
 }
 
 func isValidNote(typ string) bool {
@@ -399,6 +478,11 @@ func (h *gameHub) handle(c *gameClient, m map[string]any) {
 		if ex < -80 || ex > 80 || ey < 0 || ey > 64 || ez < -80 || ez > 80 {
 			return
 		}
+		// 只有本连接刚挖掉的 TNT 才能引爆（客户端先发 block del，再发 explode）
+		if c.tntAt.IsZero() || time.Since(c.tntAt) > 5*time.Second || c.tntX != ex || c.tntY != ey || c.tntZ != ez {
+			return
+		}
+		c.tntAt = time.Time{}
 		const radius = 3
 		removed := [][]int{}
 		for dx := -radius; dx <= radius; dx++ {
@@ -518,15 +602,12 @@ func (h *gameHub) handle(c *gameClient, m map[string]any) {
 
 	case "rename":
 		name, _ := m["name"].(string)
-		name = strings.TrimSpace(name)
-		rn := []rune(name)
-		if len(rn) == 0 || len(rn) > 32 || c.rec == nil {
+		name = strings.TrimSpace(cleanText(name, 32))
+		if name == "" || c.rec == nil {
 			return
 		}
-		if !h.store.RenamePlayer(c.IP, string(rn)) {
-			return
-		}
-		c.Name = string(rn)
+		h.store.RenamePlayer(c.IP, name) // 超出档案上限的临时访客只在本次连接内生效
+		c.Name = name
 		h.broadcast(map[string]any{"t": "rename", "id": c.ID, "name": c.Name}, nil)
 
 	case "playerRevive":
@@ -564,6 +645,9 @@ func (h *gameHub) handle(c *gameClient, m map[string]any) {
 			val = typ
 		case "del":
 			val = "-"
+			if h.store.BlockGet(key) == "tnt" {
+				c.tntX, c.tntY, c.tntZ, c.tntAt = x, y, z, time.Now()
+			}
 		default:
 			return
 		}
@@ -616,40 +700,34 @@ func lookupCC(ip string) string {
 	return res
 }
 
-func gameClientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		if i := strings.IndexByte(v, ','); i > 0 {
-			return strings.TrimSpace(v[:i])
-		}
-		return strings.TrimSpace(v)
-	}
-	if v := r.Header.Get("X-Real-IP"); v != "" {
-		return v
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
 // ---------------- WebSocket 入口 ----------------
 
 func (a *App) handleGameWS(w http.ResponseWriter, r *http.Request) {
+	ip := a.clientIP(r)
+	if !wsOriginOK(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if ok, reason := a.game.acquireConn(ip); !ok {
+		http.Error(w, reason, http.StatusTooManyRequests)
+		return
+	}
+	defer a.game.releaseConn(ip)
 	ws, err := a.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	admin := a.authOK(r)
-	ip := gameClientIP(r)
 	c := &gameClient{
-		ID:      newID()[:10],
-		Name:    "",
-		Country: lookupCC(ip), // 两位国家码；有缓存毫秒级，首次最多 3s
-		Admin:   admin,
-		conn:    ws,
-		send:    make(chan []byte, 64),
-		hub:     a.game,
+		msgBucket:   newLocalBucket(gameMsgRate, gameMsgBurst),
+		blockBucket: newLocalBucket(gameBlockRate, gameBlockBurst),
+		ID:          newID()[:10],
+		Name:        "",
+		Country:     lookupCC(ip), // 两位国家码；有缓存毫秒级，首次最多 3s
+		Admin:       admin,
+		conn:        ws,
+		send:        make(chan []byte, 64),
+		hub:         a.game,
 	}
 	if admin {
 		c.Name = "农场主"

@@ -90,3 +90,74 @@ func (f *failTracker) pruneLocked(now time.Time) {
 		}
 	}
 }
+
+// ---------------- 令牌桶（按键） ----------------
+
+type keyedLimiter struct {
+	mu         sync.Mutex
+	rate       float64 // 每秒补充
+	burst      float64
+	m          map[string]*bucket
+	maxEntries int
+	now        func() time.Time
+}
+
+func newKeyedLimiter(rate, burst float64, maxEntries int) *keyedLimiter {
+	return &keyedLimiter{rate: rate, burst: burst, m: map[string]*bucket{}, maxEntries: maxEntries, now: time.Now}
+}
+
+func (l *keyedLimiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	b, ok := l.m[key]
+	if !ok {
+		if len(l.m) >= l.maxEntries {
+			// 清理已经回满的桶；仍满则拒绝（不无限增长）
+			for k, v := range l.m {
+				if v.tokens+now.Sub(v.last).Seconds()*l.rate >= l.burst {
+					delete(l.m, k)
+				}
+			}
+			if len(l.m) >= l.maxEntries {
+				return false
+			}
+		}
+		b = &bucket{tokens: l.burst, last: now}
+		l.m[key] = b
+	}
+	b.tokens += now.Sub(b.last).Seconds() * l.rate
+	b.last = now
+	if b.tokens > l.burst {
+		b.tokens = l.burst
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// localBucket 单个连接内使用的令牌桶（调用方保证串行访问）
+type localBucket struct {
+	rate, burst, tokens float64
+	last                time.Time
+}
+
+func newLocalBucket(rate, burst float64) localBucket {
+	return localBucket{rate: rate, burst: burst, tokens: burst, last: time.Now()}
+}
+
+func (b *localBucket) allow() bool {
+	now := time.Now()
+	b.tokens += now.Sub(b.last).Seconds() * b.rate
+	b.last = now
+	if b.tokens > b.burst {
+		b.tokens = b.burst
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
