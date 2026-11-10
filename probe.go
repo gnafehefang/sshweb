@@ -2,12 +2,11 @@ package main
 
 // probe.go — 公开探针系统：
 //   管理端生成 token → 任意服务器 curl 一键安装 bash agent → 周期上报 CPU/内存/磁盘/网速
-//   农场里出现一只 📡 探针鸡，头顶主机名，点击查看状态卡片
-//   支持：完全公开 / 密码查看 / IP 第三段掩码
+//   农场里出现一只 📡 探针鸡，点击查看状态卡片
+//   支持：完全公开 / 密码查看（见 probeauth.go）/ IP 掩码
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,13 +20,15 @@ import (
 )
 
 type Probe struct {
-	ID        string    `json:"id"`
-	Token     string    `json:"token"`
-	Name      string    `json:"name,omitempty"`     // 备注名，空则用主机名
-	Public    bool      `json:"public"`             // true=完全公开 false=密码查看
-	ViewPass  string    `json:"viewPass,omitempty"` // 仅存于 data.json(0600)，任何接口不下发
-	MaskIP    bool      `json:"maskIP"`             // IP 第三段掩码
-	CreatedAt time.Time `json:"createdAt"`
+	ID           string    `json:"id"`
+	Token        string    `json:"token"`
+	Name         string    `json:"name,omitempty"`         // 备注名；未解锁的访客看不到主机名
+	Public       bool      `json:"public"`                 // true=完全公开 false=密码查看
+	ViewPass     string    `json:"viewPass,omitempty"`     // 旧版明文，仅用于加载时迁移为哈希
+	ViewPassHash string    `json:"viewPassHash,omitempty"` // 查看密码的 Argon2id 哈希
+	GrantVersion int       `json:"grantVersion"`           // 查看权限版本号，撤销授权时加 1
+	MaskIP       bool      `json:"maskIP"`                 // 对非管理员掩码 IP
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
 type probeStats struct {
@@ -76,41 +77,31 @@ func (p *probeRuntime) remove(id string) {
 	p.mu.Unlock()
 }
 
-func maskIPIp(ip string) string {
-	parts := strings.Split(ip, ".")
-	if len(parts) == 4 {
-		parts[2] = "xxx"
-		return strings.Join(parts, ".")
-	}
-	return ip
-}
-
 // 按查看者身份生成探针视图
 func (a *App) probeView(pr *Probe, forAdmin bool, unlocked bool) map[string]any {
 	st := a.probes.get(pr.ID)
 	online := st != nil && time.Since(st.LastSeen) < 15*time.Second
+	canSee := forAdmin || pr.Public || unlocked
+	hostname := ""
+	if st != nil {
+		hostname = st.Hostname
+	}
 	v := map[string]any{
 		"id":     pr.ID,
-		"name":   pr.Name,
+		"name":   probeDisplayName(pr, hostname, canSee),
 		"public": pr.Public,
 		"online": online,
 	}
-	if st != nil {
-		v["hostname"] = st.Hostname
-	}
-	canSee := forAdmin || pr.Public || unlocked
 	if canSee {
 		if st != nil {
 			ip := st.IP
 			if pr.MaskIP && !forAdmin {
-				ip = maskIPIp(ip)
+				ip = maskIP(ip)
 			}
-			if pr.Name != "" {
-				v["name"] = pr.Name
-			}
+			v["hostname"] = st.Hostname
 			v["os"] = st.OS
 			v["ip"] = ip
-			v["cc"] = lookupCC(st.IP)
+			v["cc"] = a.countryCode(st.IP)
 			v["cpu"] = st.CPU
 			v["memTotal"] = st.MemTotal
 			v["memUsed"] = st.MemUsed
@@ -154,20 +145,29 @@ func (a *App) handleProbeJoin(w http.ResponseWriter, r *http.Request) {
 		Name     string `json:"name"`
 	}
 	json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
-	if !body.Public && len(body.ViewPass) < 4 {
-		writeJSON(w, 400, map[string]string{"error": "密码查看模式需要至少 4 位密码"})
-		return
+	viewHash := ""
+	if !body.Public {
+		if len([]rune(body.ViewPass)) < minViewPassLen {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("密码查看模式需要至少 %d 位密码", minViewPassLen)})
+			return
+		}
+		h, err := hashPassword(body.ViewPass, viewArgon)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		viewHash = h
 	}
 	b := make([]byte, 16)
 	rand.Read(b)
 	pr := &Probe{
-		ID:        newID()[:12],
-		Token:     hex.EncodeToString(b),
-		Name:      strings.TrimSpace(body.Name),
-		Public:    body.Public,
-		ViewPass:  body.ViewPass,
-		MaskIP:    body.MaskIP,
-		CreatedAt: time.Now(),
+		ID:           newID()[:12],
+		Token:        hex.EncodeToString(b),
+		Name:         cleanText(strings.TrimSpace(body.Name), 32),
+		Public:       body.Public,
+		ViewPassHash: viewHash,
+		MaskIP:       body.MaskIP,
+		CreatedAt:    time.Now(),
 	}
 	if err := a.store.AddProbe(pr); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "保存失败"})
@@ -278,69 +278,11 @@ func cleanText(s string, n int) string {
 	return string(out)
 }
 
-// GET /probe/unlock?id=&pass= — 游客密码解锁探针查看
-func (a *App) handleProbeUnlock(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	pass := r.URL.Query().Get("pass")
-	pr := a.store.ProbeByID(id)
-	if pr == nil {
-		writeJSON(w, 404, map[string]string{"error": "探针不存在"})
-		return
-	}
-	if subtle.ConstantTimeCompare([]byte(pr.ViewPass), []byte(pass)) != 1 {
-		writeJSON(w, 403, map[string]string{"error": "查看密码错误"})
-		return
-	}
-	setUnlockedCookie(w, id)
-	writeJSON(w, 200, a.probeView(pr, false, true))
-}
-
 // GET /api/probes/public — 游客/管理员都能拉，按身份裁剪视图；解锁状态存服务端 Cookie
 func (a *App) handleProbesPublic(w http.ResponseWriter, r *http.Request) {
 	forAdmin := a.authOK(r)
-	unlocked := readUnlockedCookies(r)
+	unlocked := a.readUnlocked(r)
 	writeJSON(w, 200, a.probesForClient(forAdmin, unlocked))
-}
-
-func readUnlockedCookies(r *http.Request) map[string]bool {
-	out := map[string]bool{}
-	for _, c := range r.Cookies() {
-		if strings.HasPrefix(c.Name, "probe_unlock_") {
-			out[strings.TrimPrefix(c.Name, "probe_unlock_")] = true
-		}
-	}
-	return out
-}
-
-func setUnlockedCookie(w http.ResponseWriter, id string) {
-	http.SetCookie(w, &http.Cookie{
-		Name: "probe_unlock_" + id, Value: "1",
-		Path: "/", HttpOnly: true, MaxAge: 86400 * 7, SameSite: http.SameSiteLaxMode,
-	})
-}
-
-// GET /api/probe/unlockpass?pass=xx — 游客输入探针查看密码，解锁所有匹配的探针
-func (a *App) handleProbeUnlockPass(w http.ResponseWriter, r *http.Request) {
-	pass := r.URL.Query().Get("pass")
-	if len(pass) < 4 {
-		writeJSON(w, 400, map[string]string{"error": "密码太短"})
-		return
-	}
-	n := 0
-	for _, pr := range a.store.Probes() {
-		if pr.Public || pr.ViewPass == "" {
-			continue
-		}
-		if subtle.ConstantTimeCompare([]byte(pr.ViewPass), []byte(pass)) == 1 {
-			setUnlockedCookie(w, pr.ID)
-			n++
-		}
-	}
-	if n == 0 {
-		writeJSON(w, 403, map[string]string{"error": "没有匹配该密码的探针"})
-		return
-	}
-	writeJSON(w, 200, map[string]any{"unlocked": n})
 }
 
 // POST /api/probe/goodbye?t=token — 卸载时 agent 通知面板删除探针记录

@@ -168,18 +168,19 @@ func (h *gameHub) serverName(id string) string {
 	return "鸡"
 }
 
+// probeName 游戏事件里展示的探针名（广播给所有访客）：密码探针绝不暴露主机名
 func (h *gameHub) probeName(id string) string {
-	if pr := h.store.ProbeByID(id); pr != nil {
-		if pr.Name != "" {
-			return pr.Name
-		}
-		if h.probeRT != nil {
-			if st := h.probeRT.get(id); st != nil && st.Hostname != "" {
-				return st.Hostname
-			}
+	pr := h.store.ProbeByID(id)
+	if pr == nil {
+		return "探针"
+	}
+	hostname := ""
+	if pr.Public && h.probeRT != nil {
+		if st := h.probeRT.get(id); st != nil {
+			hostname = st.Hostname
 		}
 	}
-	return "探针"
+	return probeDisplayName(pr, hostname, pr.Public)
 }
 
 func (h *gameHub) eventName(clientID string) string {
@@ -695,6 +696,9 @@ func lookupCC(ip string) string {
 		log.Printf("[game] 国家识别失败 %s: %v", ip, err)
 	}
 	countryCacheMu.Lock()
+	if len(countryCache) >= 4096 { // 有界缓存
+		countryCache = map[string]string{}
+	}
 	countryCache[ip] = res
 	countryCacheMu.Unlock()
 	return res
@@ -723,7 +727,7 @@ func (a *App) handleGameWS(w http.ResponseWriter, r *http.Request) {
 		blockBucket: newLocalBucket(gameBlockRate, gameBlockBurst),
 		ID:          newID()[:10],
 		Name:        "",
-		Country:     lookupCC(ip), // 两位国家码；有缓存毫秒级，首次最多 3s
+		Country:     a.countryCode(ip), // 默认关闭；开启后有缓存毫秒级，首次最多 3s
 		Admin:       admin,
 		conn:        ws,
 		send:        make(chan []byte, 64),

@@ -40,7 +40,10 @@ func newTestEnv(t *testing.T, ssh bool) *testEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(store.Close)
-	app := newApp(cfg, store)
+	app, err := newApp(cfg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &testEnv{app: app, public: app.publicHandler(), admin: app.adminHandler()}
 }
 

@@ -172,6 +172,20 @@ func loadStore(dir string, opt storeOptions) (*Store, error) {
 		}
 	}
 	rows2.Close()
+	// 旧版明文查看密码：转换为哈希后清空
+	for _, pr := range s.ProbeList {
+		if pr.ViewPass == "" {
+			continue
+		}
+		h, err := hashPassword(pr.ViewPass, viewArgon)
+		if err != nil {
+			return fail(err)
+		}
+		pr.ViewPassHash, pr.ViewPass = h, ""
+		if err := upsertJSON(db, "probes", "id", pr.ID, pr); err != nil {
+			return fail(err)
+		}
+	}
 
 	rows3, err := db.Query("SELECT ip, data FROM players")
 	if err != nil {
@@ -363,12 +377,44 @@ func (s *Store) SavePlayer(ip string) {
 
 // ---------------- 探针 ----------------
 
+// 探针读取一律返回副本：修改只能经 UpdateProbe 等方法，避免与并发读写冲突
+
+func cloneProbe(p *Probe) *Probe {
+	c := *p
+	return &c
+}
+
 func (s *Store) Probes() []*Probe {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*Probe, len(s.ProbeList))
-	copy(out, s.ProbeList)
+	for i, p := range s.ProbeList {
+		out[i] = cloneProbe(p)
+	}
 	return out
+}
+
+var errProbeNotFound = errors.New("探针不存在")
+
+// UpdateProbe 在副本上修改，写库成功后再替换内存中的记录
+func (s *Store) UpdateProbe(id string, fn func(*Probe) error) (*Probe, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, p := range s.ProbeList {
+		if p.ID != id {
+			continue
+		}
+		next := cloneProbe(p)
+		if err := fn(next); err != nil {
+			return nil, err
+		}
+		if err := upsertJSON(s.db, "probes", "id", next.ID, next); err != nil {
+			return nil, err
+		}
+		s.ProbeList[i] = next
+		return cloneProbe(next), nil
+	}
+	return nil, errProbeNotFound
 }
 
 func (s *Store) AddProbe(pr *Probe) error {
@@ -405,7 +451,7 @@ func (s *Store) ProbeByToken(token string) *Probe {
 	defer s.mu.Unlock()
 	for _, v := range s.ProbeList {
 		if v.Token == token {
-			return v
+			return cloneProbe(v)
 		}
 	}
 	return nil
@@ -416,7 +462,7 @@ func (s *Store) ProbeByID(id string) *Probe {
 	defer s.mu.Unlock()
 	for _, v := range s.ProbeList {
 		if v.ID == id {
-			return v
+			return cloneProbe(v)
 		}
 	}
 	return nil

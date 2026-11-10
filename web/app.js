@@ -230,10 +230,10 @@ function openLoginModal() {
     try {
       let did = false;
       if (pp) {
-        const r = await fetch('api/probe/unlockpass?pa' + 'ss=' + encodeURIComponent(pp), { credentials: 'same-origin' });
-        const d = await r.json().catch(() => ({}));
-        if (r.ok && d.unlocked > 0) { toast(`已解锁 ${d.unlocked} 只密码探针鸡`); did = true; }
-        else if (!pw) throw new Error('该探针密码没有匹配到任何探针');
+        try {
+          const d = await api('api/probe/unlockpass', { method: 'POST', body: { pass: pp } });
+          if (d.unlocked > 0) { toast(`已解锁 ${d.unlocked} 只密码探针鸡`); did = true; }
+        } catch (e) { if (!pw) throw e; }
       }
       if (pw) {
         await api('api/login', { method: 'POST', body: { password: pw } });
@@ -1117,7 +1117,7 @@ farm.updateLabels = function (force) {
     const hpst = state.probeHP.get(pr.id) || { hp: chickenMaxHP, down: false };
     let html;
     if (pr.locked) {
-      html = `<div class="phead">${esc(pr.name || pr.hostname || '探针')} 🔒</div>` +
+      html = `<div class="phead">${esc(pr.name || '探针')} 🔒</div>` +
         `<div class="prow dim2">输入查看密码解锁（右上角登录处）</div>` +
         (hpst.down ? '<div class="pdown">💀 倒地</div>' : hearts(hpst.hp, chickenMaxHP));
     } else {
@@ -1949,7 +1949,7 @@ function openProbeCard(pr) {
   if (fresh.locked) {
     openModal(`
       <button class="modal-close">×</button>
-      <h2>📡 ${esc(fresh.name || fresh.hostname || '探针')} <span class="tag">🔒 密码保护</span></h2>
+      <h2>📡 ${esc(fresh.name || '探针')} <span class="tag">🔒 密码保护</span></h2>
       <p class="confirm-msg">这只探针鸡需要查看密码才能显示状态（也可以在右上角「管理登录」里输入）。</p>
       <div class="field"><label>查看密码</label><input id="pbPass" type="password"></div>
       <div id="pbErr" class="mc-err hidden"></div>
@@ -1958,9 +1958,7 @@ function openProbeCard(pr) {
     $('#pbPass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#pbOk').click(); });
     $('#pbOk').onclick = async () => {
       try {
-        const r = await fetch('api/probe/unlock?id=' + encodeURIComponent(fresh.id) + '&pa' + 'ss=' + encodeURIComponent($('#pbPass').value), { credentials: 'same-origin' });
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(d.error || '解锁失败');
+        await api('api/probe/unlock', { method: 'POST', body: { id: fresh.id, pass: $('#pbPass').value } });
         await fetchProbesNow();
         const p2 = state.probes.find(x => x.id === fresh.id);
         closeModal();
@@ -2002,16 +2000,16 @@ async function openJoinModal() {
         <option value="0">密码查看 — 仅知道密码的人可见</option>
       </select>
     </div>
-    <div class="field hidden" id="pjPassBox"><label>查看密码（≥4 位）</label><input id="pjPass" type="text" placeholder="查看此鸡状态的密码"></div>
+    <div class="field hidden" id="pjPassBox"><label>查看密码（至少 8 位）</label><input id="pjPass" type="text" placeholder="查看此鸡状态的密码"></div>
     <div class="field"><label style="display:flex;gap:8px;align-items:center;cursor:pointer">
-      <input type="checkbox" id="pjMask" checked> IP 第三段掩码（如 1.2.xxx.4，对非管理员生效）
+      <input type="checkbox" id="pjMask" checked> IP 掩码（IPv4 只显示前两段，IPv6 只显示前 32 位；对非管理员生效）
     </label></div>
     <div class="modal-actions"><button class="mc-btn" id="pjGen">生成安装命令</button></div>`);
   $('#pjPublic').onchange = () => $('#pjPassBox').classList.toggle('hidden', $('#pjPublic').value === '1');
   $('#pjGen').onclick = async () => {
     const isPub = $('#pjPublic').value === '1';
     const pass = $('#pjPass').value;
-    if (!isPub && pass.length < 4) return toast('查看密码至少 4 位', 'err');
+    if (!isPub && [...pass].length < 8) return toast('查看密码至少 8 位', 'err');
     try {
       const r = await api('api/probe/join', { method: 'POST', body: {
         public: isPub, viewPass: isPub ? '' : pass, maskIP: $('#pjMask').checked, name: $('#pjName').value.trim(),
@@ -2703,6 +2701,7 @@ function openAdmin() {
       <td>${pr.online ? '<span class="tag ok">在线</span>' : '<span class="tag bad">离线</span>'}</td>
       <td><div class="row-actions">
         <button class="ic-btn" data-pact="view" title="查看状态">📊</button>
+        ${pr.public ? '' : '<button class="ic-btn" data-pact="revoke" title="撤销所有已解锁访客（需重新输入查看密码）">🔁</button>'}
         <button class="ic-btn danger" data-pact="del" title="移除探针">🗑</button>
       </div></td>
     </tr>`;
@@ -2756,6 +2755,10 @@ function openAdmin() {
       if (b.dataset.pact === 'view') {
         const pr = state.probes.find(x => x.id === id);
         closeModal(); openProbeCard(pr);
+      }
+      if (b.dataset.pact === 'revoke') {
+        if (!await uiConfirm('撤销所有已解锁这只探针的访客？他们需要重新输入查看密码。', { title: '撤销查看权限', okText: '撤销' })) return;
+        try { await api('api/probes/revoke', { method: 'POST', body: { id } }); toast('已撤销'); } catch (e) { toast(e.message, 'err'); }
       }
       if (b.dataset.pact === 'del') {
         if (!await uiConfirm('移除这个探针？agent 上报会被拒绝，建议同时在目标机执行卸载命令。', { title: '移除探针', okText: '移除', danger: true })) return;

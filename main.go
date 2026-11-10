@@ -38,6 +38,8 @@ type App struct {
 	// 管理密码失败计数：按来源 IP，以及全局兜底
 	loginFails       *failTracker
 	loginFailsGlobal *failTracker
+	unlockFails      *failTracker // 探针查看密码失败计数（按来源）
+	probeSigner      *probeSigner // 探针解锁 Cookie 签名
 	pool             *sshx.Pool
 	upgrader         websocket.Upgrader
 	game             *gameHub
@@ -249,8 +251,8 @@ func (a *App) publicHandler() http.Handler {
 	a.registerCommon(m)
 	m.HandleFunc("/api/probe/report", a.handleProbeReport)
 	m.HandleFunc("/api/probe/goodbye", a.handleProbeGoodbye)
-	m.HandleFunc("/api/probe/unlock", a.handleProbeUnlock)
-	m.HandleFunc("/api/probe/unlockpass", a.handleProbeUnlockPass)
+	m.HandleFunc("/api/probe/unlock", publicBrowserWrite(a.handleProbeUnlock))
+	m.HandleFunc("/api/probe/unlockpass", publicBrowserWrite(a.handleProbeUnlockPass))
 	m.HandleFunc("/probe/agent.sh", a.handleProbeAgentScript)
 	m.HandleFunc("/probe/uninstall.sh", a.handleProbeUninstallScript)
 	m.HandleFunc("/api/skill/blocks", a.handleSkillBlocks)
@@ -269,6 +271,7 @@ func (a *App) adminHandler() http.Handler {
 	m.HandleFunc("/api/password", a.require(a.handleChangePassword))
 	m.HandleFunc("/api/probe/join", a.require(a.handleProbeJoin))
 	m.HandleFunc("/api/probes", a.require(a.handleProbes))
+	m.HandleFunc("/api/probes/revoke", a.require(a.handleProbeRevoke))
 	m.HandleFunc("/api/keys", a.require(a.handleAPIKeys))
 	m.HandleFunc("/api/admin/clearblocks", a.require(a.handleClearBlocks))
 	if a.cfg.EnableSSH {
@@ -280,7 +283,11 @@ func (a *App) adminHandler() http.Handler {
 	return withSite(st, adminAPIGuard(st, m))
 }
 
-func newApp(cfg *Config, store *Store) *App {
+func newApp(cfg *Config, store *Store) (*App, error) {
+	signer, err := store.loadProbeSigner()
+	if err != nil {
+		return nil, err
+	}
 	app := &App{
 		cfg:      cfg,
 		store:    store,
@@ -288,13 +295,16 @@ func newApp(cfg *Config, store *Store) *App {
 		// 每个来源 5 次失败锁 15 分钟（之后翻倍，最长 24 小时）；全局 10 分钟内 50 次失败锁 5 分钟
 		loginFails:       newFailTracker(5, 15*time.Minute, 15*time.Minute, 24*time.Hour),
 		loginFailsGlobal: newFailTracker(50, 10*time.Minute, 5*time.Minute, time.Hour),
-		pool:             sshx.NewPool(),
-		upgrader:         websocket.Upgrader{CheckOrigin: wsOriginOK},
+		// 每个来源 1 分钟内 5 次失败锁 1 分钟，之后翻倍，最长 1 小时
+		unlockFails: newFailTracker(5, time.Minute, time.Minute, time.Hour),
+		probeSigner: signer,
+		pool:        sshx.NewPool(),
+		upgrader:    websocket.Upgrader{CheckOrigin: wsOriginOK},
 	}
 	app.probes = newProbeRuntime()
 	app.game = newGameHub(store)
 	app.game.probeRT = app.probes
-	return app
+	return app, nil
 }
 
 func newHTTPServer(addr string, h http.Handler) *http.Server {
@@ -319,7 +329,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载数据失败: %v", err)
 	}
-	app := newApp(cfg, store)
+	app, err := newApp(cfg, store)
+	if err != nil {
+		log.Fatalf("初始化失败: %v", err)
+	}
 	go app.sessions.janitor(time.Minute)
 
 	mode := "探针版（SSH 关闭）"
