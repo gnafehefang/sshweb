@@ -167,7 +167,10 @@ func (a *App) handleProbeJoin(w http.ResponseWriter, r *http.Request) {
 		MaskIP:    body.MaskIP,
 		CreatedAt: time.Now(),
 	}
-	a.store.AddProbe(pr)
+	if err := a.store.AddProbe(pr); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "保存失败"})
+		return
+	}
 	// v0.5.0：全员无限材料，不再发每日探针奖励
 	base := requestBaseURL(r)
 	writeJSON(w, 200, map[string]any{

@@ -1,14 +1,18 @@
 package main
 
 // store.go — SQLite 持久化存储（modernc.org/sqlite 纯 Go 驱动，无 cgo，单二进制）
-//   表：meta(k,v) 密码等元数据 / servers / probes / players(JSON blob)
-//       blocks(x,y,z,type) 主键 (x,y,z) / apikeys(key,name,created_at)
-//   首次启动自动从旧 data.json 迁移一次，迁移后旧文件改名 data.json.migrated
+//   表：meta(k,v) 元数据 / servers / probes / players(JSON blob)
+//       blocks(x,y,z,type) 主键 (x,y,z) / apikeys
+//   每条记录单独 upsert / delete，不再整表删除重写。
+//
+//   本 fork 不再导入旧版 data.json，也删除了从 data.json.migrated 恢复的逻辑：
+//   数据目录里出现这类旧文件会直接拒绝启动（其中可能含明文 SSH 凭据）。
 
 import (
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -84,81 +88,46 @@ func openDB(dir string) (*sql.DB, error) {
 	return db, nil
 }
 
-// legacyStore 旧 data.json 的结构（迁移用；tag 必须与旧版序列化键一致，否则迁移丢数据）
-type legacyStore struct {
-	Password  string
-	Servers   []*Server
-	Blocks    map[string]string      `json:"blocks"`
-	ProbeList []*Probe               `json:"probes"`
-	Players   map[string]*FarmPlayer `json:"players"`
+// legacyFiles 旧版遗留文件：本 fork 不导入，出现即拒绝启动。
+var legacyFiles = []string{"data.json", "data.json.migrated"}
+
+func checkLegacyFiles(dir string) error {
+	for _, name := range legacyFiles {
+		_, err := os.Stat(filepath.Join(dir, name))
+		if err == nil {
+			return fmt.Errorf("数据目录中存在旧版文件 %s：本版本不导入旧数据（其中可能含明文凭据）。"+
+				"请改用全新的数据卷；旧卷中出现过的凭据请按已泄露处理并轮换", name)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
-func loadStore(dir string) (*Store, error) {
+func loadStore(dir string, enableSSH bool) (*Store, error) {
+	if err := checkLegacyFiles(dir); err != nil {
+		return nil, err
+	}
 	db, err := openDB(dir)
 	if err != nil {
 		return nil, err
 	}
 	s := &Store{db: db, dir: dir, Password: "admin888", Players: map[string]*FarmPlayer{}}
+	fail := func(err error) (*Store, error) { db.Close(); return nil, err }
 
-	// 从旧 data.json 一次性迁移
-	jsonPath := filepath.Join(dir, "data.json")
-	if b, err := os.ReadFile(jsonPath); err == nil {
-		var old legacyStore
-		if err := json.Unmarshal(b, &old); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("data.json 解析失败: %w", err)
+	// 探针模式：库里只要有服务器记录就拒绝启动，保证公开实例从不持有 SSH 凭据。
+	if !enableSSH {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM servers").Scan(&n); err != nil {
+			return fail(err)
 		}
-		s.Password = old.Password
-		s.Servers = old.Servers
-		s.ProbeList = old.ProbeList
-		if old.Players != nil {
-			s.Players = old.Players
+		if n > 0 {
+			return fail(fmt.Errorf("SSH 功能未开启（SSHWEB_ENABLE_SSH=0），但数据库里有 %d 条服务器记录。"+
+				"探针模式不加载任何 SSH 凭据：请改用全新的数据卷", n))
 		}
-		if err := s.save(); err != nil {
-			db.Close()
-			return nil, err
-		}
-		if len(old.Blocks) > 0 {
-			tx, err := db.Begin()
-			if err != nil {
-				db.Close()
-				return nil, err
-			}
-			st, err := tx.Prepare("INSERT OR REPLACE INTO blocks(x,y,z,type) VALUES(?,?,?,?)")
-			if err != nil {
-				tx.Rollback()
-				db.Close()
-				return nil, err
-			}
-			n := 0
-			for k, v := range old.Blocks {
-				if v == "-" || v == "" {
-					continue
-				}
-				var x, y, z int
-				if _, err := fmt.Sscanf(k, "%d,%d,%d", &x, &y, &z); err != nil {
-					continue
-				}
-				if _, err := st.Exec(x, y, z, v); err == nil {
-					n++
-				}
-			}
-			st.Close()
-			if err := tx.Commit(); err != nil {
-				db.Close()
-				return nil, err
-			}
-			log.Printf("[store] 从 data.json 迁移 %d 个方块到 SQLite", n)
-		}
-		if err := os.Rename(jsonPath, jsonPath+".migrated"); err != nil {
-			log.Printf("[store] data.json 改名失败: %v", err)
-		} else {
-			log.Printf("[store] 旧 data.json 已迁移到 SQLite，改名为 data.json.migrated")
-		}
-		return s, nil
 	}
 
-	// 正常从 SQLite 加载
 	if v, err := s.metaGet("password"); err == nil && v != "" {
 		s.Password = v
 	} else {
@@ -167,93 +136,60 @@ func loadStore(dir string) (*Store, error) {
 		} else {
 			log.Printf("[sshweb] 警告: 未设置 SSHWEB_PASSWORD，正在使用默认密码 admin888，请尽快在界面右上角修改")
 		}
-		if err := s.save(); err != nil {
-			return nil, err
+		if err := s.metaSet("password", s.Password); err != nil {
+			return fail(err)
 		}
 	}
-	rows, err := db.Query("SELECT data FROM servers")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var raw string
-		rows.Scan(&raw)
-		var sv Server
-		if json.Unmarshal([]byte(raw), &sv) == nil {
-			s.Servers = append(s.Servers, &sv)
+
+	if enableSSH {
+		rows, err := db.Query("SELECT data FROM servers")
+		if err != nil {
+			return fail(err)
 		}
+		for rows.Next() {
+			var raw string
+			if rows.Scan(&raw) != nil {
+				continue
+			}
+			var sv Server
+			if json.Unmarshal([]byte(raw), &sv) == nil {
+				s.Servers = append(s.Servers, &sv)
+			}
+		}
+		rows.Close()
 	}
+
 	rows2, err := db.Query("SELECT data FROM probes")
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
-	defer rows2.Close()
 	for rows2.Next() {
 		var raw string
-		rows2.Scan(&raw)
+		if rows2.Scan(&raw) != nil {
+			continue
+		}
 		var pr Probe
 		if json.Unmarshal([]byte(raw), &pr) == nil {
 			s.ProbeList = append(s.ProbeList, &pr)
 		}
 	}
+	rows2.Close()
+
 	rows3, err := db.Query("SELECT ip, data FROM players")
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
-	defer rows3.Close()
 	for rows3.Next() {
 		var ip, raw string
-		rows3.Scan(&ip, &raw)
+		if rows3.Scan(&ip, &raw) != nil {
+			continue
+		}
 		var p FarmPlayer
 		if json.Unmarshal([]byte(raw), &p) == nil {
 			s.Players[ip] = &p
 		}
 	}
-
-	// 灾难恢复（只执行一次）：v0.5.0 的迁移 bug 曾丢探针/玩家数据（legacyStore 缺 json tag）。
-	// data.json.migrated 存在且未恢复过时，把其中 SQLite 里缺失的探针/服务器/玩家按 ID 合并回来。
-	didRecover, _ := s.metaGet("recovered_migrated")
-	if didRecover == "" {
-		if b, err := os.ReadFile(jsonPath + ".migrated"); err == nil {
-			var old legacyStore
-			if json.Unmarshal(b, &old) == nil {
-				np, ns, npl := 0, 0, 0
-				haveP := map[string]bool{}
-				for _, pr := range s.ProbeList {
-					haveP[pr.ID] = true
-				}
-				for _, pr := range old.ProbeList {
-					if pr != nil && !haveP[pr.ID] {
-						s.ProbeList = append(s.ProbeList, pr)
-						np++
-					}
-				}
-				haveS := map[string]bool{}
-				for _, sv := range s.Servers {
-					haveS[sv.ID] = true
-				}
-				for _, sv := range old.Servers {
-					if sv != nil && !haveS[sv.ID] {
-						s.Servers = append(s.Servers, sv)
-						ns++
-					}
-				}
-				for ip, pl := range old.Players {
-					if _, ok := s.Players[ip]; !ok && pl != nil {
-						s.Players[ip] = pl
-						npl++
-					}
-				}
-				if np+ns+npl > 0 {
-					if err := s.save(); err == nil {
-						log.Printf("[store] 从 data.json.migrated 恢复：%d 探针 / %d 服务器 / %d 玩家", np, ns, npl)
-					}
-				}
-			}
-			s.metaSet("recovered_migrated", "1")
-		}
-	}
+	rows3.Close()
 	return s, nil
 }
 
@@ -263,65 +199,23 @@ func (s *Store) metaGet(k string) (string, error) {
 	return v, err
 }
 
-func (s *Store) metaSet(k, v string) {
-	s.db.Exec("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", k, v)
+func (s *Store) metaSet(k, v string) error {
+	_, err := s.db.Exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", k, v)
+	return err
 }
 
-// save 把密码/服务器/探针/玩家整体写回 SQLite（数据量小，全量替换简单可靠）
-func (s *Store) save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saveLocked()
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
 }
 
-func (s *Store) saveLocked() error {
-	tx, err := s.db.Begin()
+// upsertJSON 行级写入（table/keyCol 只来自代码常量）
+func upsertJSON(ex execer, table, keyCol, key string, v any) error {
+	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if _, err := tx.Exec("INSERT OR REPLACE INTO meta(k,v) VALUES('password',?)", s.Password); err != nil {
-		return err
-	}
-	if _, err := tx.Exec("DELETE FROM servers"); err != nil {
-		return err
-	}
-	st, _ := tx.Prepare("INSERT INTO servers(id,data) VALUES(?,?)")
-	for _, sv := range s.Servers {
-		b, _ := json.Marshal(sv)
-		st.Exec(sv.ID, string(b))
-	}
-	st.Close()
-	if _, err := tx.Exec("DELETE FROM probes"); err != nil {
-		return err
-	}
-	st2, _ := tx.Prepare("INSERT INTO probes(id,data) VALUES(?,?)")
-	for _, pr := range s.ProbeList {
-		b, _ := json.Marshal(pr)
-		st2.Exec(pr.ID, string(b))
-	}
-	st2.Close()
-	if _, err := tx.Exec("DELETE FROM players"); err != nil {
-		return err
-	}
-	st3, _ := tx.Prepare("INSERT INTO players(ip,data) VALUES(?,?)")
-	for ip, p := range s.Players {
-		b, _ := json.Marshal(p)
-		st3.Exec(ip, string(b))
-	}
-	st3.Close()
-	return tx.Commit()
-}
-
-func (s *Store) SaveAsync() { go s.save() }
-
-// UpdatePlayerPos 记录游客最后位置（内存即时，落盘由 SaveAsync 节流）
-func (s *Store) UpdatePlayerPos(ip string, x, y, z float64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if p, ok := s.Players[ip]; ok && p != nil {
-		p.HasPos, p.PX, p.PY, p.PZ = true, x, y, z
-	}
+	_, err = ex.Exec("INSERT INTO "+table+"("+keyCol+",data) VALUES(?,?) ON CONFLICT("+keyCol+") DO UPDATE SET data=excluded.data", key, string(b))
+	return err
 }
 
 // ---------------- 方块（直写 SQLite） ----------------
@@ -411,7 +305,9 @@ func (s *Store) GetOrCreatePlayer(ip string) *FarmPlayer {
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 	s.Players[ip] = p
-	go s.save()
+	if err := upsertJSON(s.db, "players", "ip", ip, p); err != nil {
+		log.Printf("[store] 保存玩家失败: %v", err)
+	}
 	return p
 }
 
@@ -424,6 +320,41 @@ func (s *Store) PlayerByIP(ip string) *FarmPlayer {
 	return s.Players[ip]
 }
 
+// UpdatePlayerPos 记录游客最后位置（内存即时；落盘由调用方节流调用 SavePlayer）
+func (s *Store) UpdatePlayerPos(ip string, x, y, z float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, ok := s.Players[ip]; ok && p != nil {
+		p.HasPos, p.PX, p.PY, p.PZ = true, x, y, z
+	}
+}
+
+// RenamePlayer 改名并落盘，返回是否成功
+func (s *Store) RenamePlayer(ip, name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.Players[ip]
+	if !ok || p == nil {
+		return false
+	}
+	p.Name = name
+	if err := upsertJSON(s.db, "players", "ip", ip, p); err != nil {
+		log.Printf("[store] 保存玩家失败: %v", err)
+	}
+	return true
+}
+
+// SavePlayer 把单个玩家的当前快照写入 SQLite
+func (s *Store) SavePlayer(ip string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, ok := s.Players[ip]; ok && p != nil {
+		if err := upsertJSON(s.db, "players", "ip", ip, p); err != nil {
+			log.Printf("[store] 保存玩家失败: %v", err)
+		}
+	}
+}
+
 // ---------------- 探针 ----------------
 
 func (s *Store) Probes() []*Probe {
@@ -434,15 +365,23 @@ func (s *Store) Probes() []*Probe {
 	return out
 }
 
-func (s *Store) AddProbe(pr *Probe) {
+func (s *Store) AddProbe(pr *Probe) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := upsertJSON(s.db, "probes", "id", pr.ID, pr); err != nil {
+		return err
+	}
 	s.ProbeList = append(s.ProbeList, pr)
-	s.mu.Unlock()
-	go s.save()
+	return nil
 }
 
 func (s *Store) DeleteProbe(id string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec("DELETE FROM probes WHERE id=?", id); err != nil {
+		log.Printf("[store] 删除探针失败: %v", err)
+		return
+	}
 	out := s.ProbeList[:0]
 	for _, v := range s.ProbeList {
 		if v.ID != id {
@@ -450,8 +389,6 @@ func (s *Store) DeleteProbe(id string) {
 		}
 	}
 	s.ProbeList = out
-	s.mu.Unlock()
-	go s.save()
 }
 
 func (s *Store) ProbeByToken(token string) *Probe {
@@ -506,17 +443,26 @@ func (s *Store) Put(sv *Server) error {
 	for i, v := range s.Servers {
 		if v.ID == sv.ID {
 			sv.CreatedAt, sv.LastUsed = v.CreatedAt, v.LastUsed
+			if err := upsertJSON(s.db, "servers", "id", sv.ID, sv); err != nil {
+				return err
+			}
 			s.Servers[i] = sv
-			return s.saveLocked()
+			return nil
 		}
 	}
+	if err := upsertJSON(s.db, "servers", "id", sv.ID, sv); err != nil {
+		return err
+	}
 	s.Servers = append(s.Servers, sv)
-	return s.saveLocked()
+	return nil
 }
 
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, err := s.db.Exec("DELETE FROM servers WHERE id=?", id); err != nil {
+		return err
+	}
 	out := s.Servers[:0]
 	for _, v := range s.Servers {
 		if v.ID != id {
@@ -524,7 +470,7 @@ func (s *Store) Delete(id string) error {
 		}
 	}
 	s.Servers = out
-	return s.saveLocked()
+	return nil
 }
 
 func (s *Store) Touch(id string) {
@@ -533,7 +479,7 @@ func (s *Store) Touch(id string) {
 	for _, v := range s.Servers {
 		if v.ID == id {
 			v.LastUsed = time.Now()
-			s.saveLocked()
+			upsertJSON(s.db, "servers", "id", v.ID, v)
 			return
 		}
 	}
@@ -542,8 +488,11 @@ func (s *Store) Touch(id string) {
 func (s *Store) SetPassword(pw string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.metaSet("password", pw); err != nil {
+		return err
+	}
 	s.Password = pw
-	return s.saveLocked()
+	return nil
 }
 
 func (s *Store) Close() {

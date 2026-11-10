@@ -387,7 +387,7 @@ func (h *gameHub) handle(c *gameClient, m map[string]any) {
 				c.lastPosSave = now
 				go func(ip string, x, y, z float64) {
 					h.store.UpdatePlayerPos(ip, x, y, z)
-					h.store.SaveAsync()
+					h.store.SavePlayer(ip)
 				}(c.IP, c.X, c.Y, c.Z)
 			}
 		}
@@ -523,9 +523,10 @@ func (h *gameHub) handle(c *gameClient, m map[string]any) {
 		if len(rn) == 0 || len(rn) > 32 || c.rec == nil {
 			return
 		}
-		c.rec.Name = string(rn)
-		c.Name = c.rec.Name
-		h.store.SaveAsync()
+		if !h.store.RenamePlayer(c.IP, string(rn)) {
+			return
+		}
+		c.Name = string(rn)
 		h.broadcast(map[string]any{"t": "rename", "id": c.ID, "name": c.Name}, nil)
 
 	case "playerRevive":

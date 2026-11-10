@@ -6,7 +6,6 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io/fs"
 	"log"
@@ -67,6 +66,7 @@ func (ss *Sessions) newToken() string {
 // ---------------- HTTP ----------------
 
 type App struct {
+	cfg      *Config
 	store    *Store
 	sessions *Sessions
 	pool     *sshx.Pool
@@ -304,22 +304,20 @@ func (s *Server) ServerInfo() sshx.ServerInfo {
 }
 
 func main() {
-	dataEnv := os.Getenv("SSHWEB_DATA")
-	if dataEnv == "" {
-		dataEnv = "data"
+	cfg, err := loadConfig(os.Args[1:], os.Getenv, os.Stderr)
+	if err != nil {
+		log.Fatalf("配置错误: %v", err)
 	}
-	dir := flag.String("data", dataEnv, "数据目录")
-	listen := flag.String("listen", ":45678", "监听地址")
-	flag.Parse()
-	if err := os.MkdirAll(*dir, 0o700); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		log.Fatal(err)
 	}
 
-	store, err := loadStore(*dir)
+	store, err := loadStore(cfg.DataDir, cfg.EnableSSH)
 	if err != nil {
 		log.Fatalf("加载数据失败: %v", err)
 	}
 	app := &App{
+		cfg:      cfg,
 		store:    store,
 		sessions: &Sessions{m: map[string]time.Time{}},
 		pool:     sshx.NewPool(),
@@ -334,9 +332,11 @@ func main() {
 	mux.HandleFunc("/api/logout", app.require(app.handleLogout))
 	mux.HandleFunc("/api/password", app.require(app.handleChangePassword))
 	mux.HandleFunc("/api/session", app.handleSession)
-	mux.HandleFunc("/api/servers", app.require(app.handleServers))
-	mux.HandleFunc("/api/servers/", app.require(app.handleServerOne))
-	mux.HandleFunc("/ws/terminal", app.handleTerminal)
+	if cfg.EnableSSH {
+		mux.HandleFunc("/api/servers", app.require(app.handleServers))
+		mux.HandleFunc("/api/servers/", app.require(app.handleServerOne))
+		mux.HandleFunc("/ws/terminal", app.handleTerminal)
+	}
 	mux.HandleFunc("/ws/game", app.handleGameWS)
 	mux.HandleFunc("/api/farm/public", app.handleFarmPublic)
 	mux.HandleFunc("/api/probe/join", app.handleProbeJoin)
@@ -363,7 +363,11 @@ func main() {
 		fileServer.ServeHTTP(w, r)
 	})
 
-	srv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	fmt.Printf("SSHWeb v%s · 监听 %s · 数据 %s\n", version, *listen, *dir)
+	srv := &http.Server{Addr: cfg.Listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	mode := "探针版（SSH 关闭）"
+	if cfg.EnableSSH {
+		mode = "SSH 已开启"
+	}
+	fmt.Printf("SSHWeb v%s · %s · 监听 %s · 数据 %s\n", version, mode, cfg.Listen, cfg.DataDir)
 	log.Fatal(srv.ListenAndServe())
 }
